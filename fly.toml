@@ -1,0 +1,21 @@
+# ── Fly.io ────────────────────────────────────────────────
+# النشر:
+#   fly launch --no-deploy
+#   fly secrets set TELEGRAM_BOT_TOKEN=... SUPABASE_URL=... \
+#                 SUPABASE_SERVICE_ROLE_KEY=... OWNER_TELEGRAM_ID=...
+#   fly deploy
+app = "fuel-station-bot"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[processes]
+  app = "python -m app.main"
+
+[vm]
+  memory = "256mb"
+  cores = 1

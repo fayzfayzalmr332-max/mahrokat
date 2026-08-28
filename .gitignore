@@ -1,0 +1,25 @@
+# ⚠️ حماية الأسرار — ممنوع منعاً باتاً رفع ملفات الإعدادات الحقيقية
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log

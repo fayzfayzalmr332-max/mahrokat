@@ -1,0 +1,26 @@
+# ── Render Blueprint ──────────────────────────────────────
+# النوع: Worker + Polling (يعمل دائماً على الخطة المجانية)
+# ضع قيم الأسرار الحقيقية من Dashboard:
+#    Dashboard → Your Service → Environment → Secret Files /
+#    Individual Environment Variables
+services:
+  - type: worker
+    name: fuel-station-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python -m app.main
+    autoDeploy: true
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OWNER_TELEGRAM_ID
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
