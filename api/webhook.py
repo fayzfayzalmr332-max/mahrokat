@@ -93,7 +93,7 @@ async def _process_update(payload: dict) -> None:
         persistence = application.persistence
         if persistence is not None:
             try:
-                persistence.flush()
+                await persistence.flush()
             except Exception:  # noqa: BLE001
                 logger.exception("فشل حفظ الحالة بعد معالجة التحديث")
 

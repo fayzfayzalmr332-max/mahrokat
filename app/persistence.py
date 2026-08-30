@@ -122,34 +122,34 @@ class SupabasePersistence(BasePersistence):
         return state
 
     # ── bot_data ──────────────────────────────────────────────
-    def get_bot_data(self):
+    async def get_bot_data(self):
         return self._load()["bot_data"]
 
-    def update_bot_data(self, data: dict) -> None:
+    async def update_bot_data(self, data: dict) -> None:
         self._load()["bot_data"] = dict(data)
         self._dirty = True
 
     # ── user_data ─────────────────────────────────────────────
-    def get_user_data(self) -> dict:
+    async def get_user_data(self) -> dict:
         return self._load()["user_data"]
 
-    def update_user_data(self, user_id: int, data: dict) -> None:
+    async def update_user_data(self, user_id: int, data: dict) -> None:
         self._load()["user_data"][user_id] = data
         self._dirty = True
 
     # ── chat_data ─────────────────────────────────────────────
-    def get_chat_data(self) -> dict:
+    async def get_chat_data(self) -> dict:
         return self._load()["chat_data"]
 
-    def update_chat_data(self, chat_id: int, data: dict) -> None:
+    async def update_chat_data(self, chat_id: int, data: dict) -> None:
         self._load()["chat_data"][chat_id] = data
         self._dirty = True
 
     # ── conversations (حالة ConversationHandler) ──────────────
-    def get_conversations(self, name: str):
+    async def get_conversations(self, name: str):
         return self._load()["conversations"].setdefault(name, {})
 
-    def update_conversation(self, name: str, key: tuple, new_state: object) -> None:
+    async def update_conversation(self, name: str, key: tuple, new_state: object) -> None:
         conv = self._load()["conversations"].setdefault(name, {})
         if new_state is None:
             conv.pop(key, None)
@@ -158,32 +158,32 @@ class SupabasePersistence(BasePersistence):
         self._dirty = True
 
     # ── callback_data غير مستخدمة ─────────────────────────────
-    def get_callback_data(self):
+    async def get_callback_data(self):
         return None
 
-    def update_callback_data(self, data) -> None:  # noqa: ARG002
-        pass
+    async def update_callback_data(self, data) -> None:  # noqa: ARG002
+        return None
 
     # ── refresh / drop ────────────────────────────────────────
-    def refresh_bot_data(self, data) -> None:  # noqa: ARG002
-        pass
+    async def refresh_bot_data(self, data) -> None:  # noqa: ARG002
+        return None
 
-    def refresh_chat_data(self, chat_id: int, data) -> None:  # noqa: ARG002
-        pass
+    async def refresh_chat_data(self, chat_id: int, data) -> None:  # noqa: ARG002
+        return None
 
-    def refresh_user_data(self, user_id: int, data) -> None:  # noqa: ARG002
-        pass
+    async def refresh_user_data(self, user_id: int, data) -> None:  # noqa: ARG002
+        return None
 
-    def drop_chat_data(self, chat_id: int) -> None:  # noqa: ARG002
+    async def drop_chat_data(self, chat_id: int) -> None:  # noqa: ARG002
         self._load()["chat_data"].pop(chat_id, None)
         self._dirty = True
 
-    def drop_user_data(self, user_id: int) -> None:  # noqa: ARG002
+    async def drop_user_data(self, user_id: int) -> None:  # noqa: ARG002
         self._load()["user_data"].pop(user_id, None)
         self._dirty = True
 
     # ── الكتابة ───────────────────────────────────────────────
-    def flush(self) -> None:
+    async def flush(self) -> None:
         """كتابة الحالة كاملة إلى Supabase (upsert مع دمج أمامي للأمان)."""
         if not self._dirty or self._cache is None:
             return

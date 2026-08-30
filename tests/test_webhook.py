@@ -60,7 +60,7 @@ def test_webhook_processes_real_update(monkeypatch):
     import api.webhook as m  # noqa: PLC0415
 
     class DummyPersistence:
-        def flush(self):
+        async def flush(self):
             self.flushed = True
 
     class DummyBot:
@@ -200,3 +200,58 @@ def test_alert_accepts_bearer_cron_secret(monkeypatch):
         "/api/alert", headers={"Authorization": "Bearer wrong"}
     )
     assert resp2.status_code == 401
+
+
+def test_persistence_matches_ptb_async_contract(monkeypatch):
+    """PTB 20.x يشترط أن تكون كل دوال BasePersistence غير متزامنة (async).
+
+    هذا الاختبار يمنع انحدار الخطأ: object dict can't be used in 'await'.
+    """
+    import asyncio
+    import inspect
+
+    from telegram.ext import BasePersistence
+
+    import app.persistence as pmod
+    from app.persistence import SupabasePersistence
+
+    # عزل كامل عن الشبكة: قاعدة بيانات وهمية في الذاكرة
+    store: dict = {}
+
+    monkeypatch.setattr(pmod.db, "get_setting", lambda key: store.get(key, ""))
+    monkeypatch.setattr(
+        pmod.db,
+        "set_setting",
+        lambda key, value: store.__setitem__(key, value),
+    )
+
+    p = SupabasePersistence()
+    for name in dir(BasePersistence):
+        base_fn = getattr(BasePersistence, name, None)
+        if base_fn is None or name.startswith("_"):
+            continue
+        if not callable(base_fn):
+            continue
+        ours = getattr(p, name, None)
+        assert ours is not None, f"الدالة {name} غير منفَّذة"
+        if inspect.iscoroutinefunction(base_fn):
+            assert inspect.iscoroutinefunction(ours), (
+                f"الدالة {name} يجب أن تكون async (متطلب PTB 20.7)"
+            )
+
+    # تحقق سلوكي: الاستدعاء بـ await يعمل فعلاً ويعيد الأنواع الصحيحة
+    async def _check():
+        assert isinstance(await p.get_bot_data(), dict)
+        assert isinstance(await p.get_user_data(), dict)
+        assert isinstance(await p.get_chat_data(), dict)
+        assert isinstance(await p.get_conversations("x"), dict)
+        assert (await p.get_callback_data()) is None
+        await p.update_user_data(1, {"a": 1})
+        await p.update_conversation("x", (1, 1), "state")
+        await p.flush()
+        return True
+
+    assert asyncio.run(_check()) is True
+    # الحالة حُفظت فعلاً في المخزن الوهمي (دورة كاملة: تحديث → flush → تخزين)
+    assert "ptb_persistence_v1" in store
+    assert "a" in store["ptb_persistence_v1"]
