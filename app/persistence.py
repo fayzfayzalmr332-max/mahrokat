@@ -165,13 +165,15 @@ class SupabasePersistence(BasePersistence):
         return None
 
     # ── refresh / drop ────────────────────────────────────────
-    async def refresh_bot_data(self, data) -> None:  # noqa: ARG002
+    # ملاحظة حرجة: PTB يستدعي هذه الدوال بأسماء المعاملات ككلمات مفتاحية
+    # (refresh_chat_data(chat_id=..., chat_data=...)) — يجب مطابقة الأسماء حرفياً.
+    async def refresh_bot_data(self, bot_data) -> None:  # noqa: ARG002
         return None
 
-    async def refresh_chat_data(self, chat_id: int, data) -> None:  # noqa: ARG002
+    async def refresh_chat_data(self, chat_id: int, chat_data) -> None:  # noqa: ARG002
         return None
 
-    async def refresh_user_data(self, user_id: int, data) -> None:  # noqa: ARG002
+    async def refresh_user_data(self, user_id: int, user_data) -> None:  # noqa: ARG002
         return None
 
     async def drop_chat_data(self, chat_id: int) -> None:  # noqa: ARG002

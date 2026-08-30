@@ -232,12 +232,23 @@ def test_persistence_matches_ptb_async_contract(monkeypatch):
             continue
         if not callable(base_fn):
             continue
-        ours = getattr(p, name, None)
+        ours = getattr(SupabasePersistence, name, None)
         assert ours is not None, f"الدالة {name} غير منفَّذة"
         if inspect.iscoroutinefunction(base_fn):
             assert inspect.iscoroutinefunction(ours), (
                 f"الدالة {name} يجب أن تكون async (متطلب PTB 20.7)"
             )
+        # مطابقة أسماء المعاملات حرفياً — PTB يستدعي بعض الدوال بالكلمات
+        # المفتاحية (مثل refresh_chat_data(chat_id=, chat_data=)) وأي اسم
+        # مختلف يرمي TypeError على كل تحديث.
+        try:
+            base_params = list(inspect.signature(base_fn).parameters)
+            our_params = list(inspect.signature(ours).parameters)
+        except (TypeError, ValueError):  # noqa: PERF203
+            continue
+        assert base_params == our_params, (
+            f"توقيع {name} لا يطابق PTB:\n  base: {base_params}\n  ours: {our_params}"
+        )
 
     # تحقق سلوكي: الاستدعاء بـ await يعمل فعلاً ويعيد الأنواع الصحيحة
     async def _check():
