@@ -1,5 +1,6 @@
 python-telegram-bot>=21.8,<23
 supabase>=2.10,<4
+flask>=3.0
 
 # ── للتطوير والاختبار فقط (اختياري) ──
 # pytest>=8.0

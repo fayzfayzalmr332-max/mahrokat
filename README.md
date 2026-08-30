@@ -161,7 +161,42 @@ python -m pytest
 ```
 
 
-## ⚙️ وضع Webhook (اختياري)
+## ☁️ النشر على Vercel (Webhook — بدون بطاقة بنكية)
+
+Vercel Serverless يستقبل التحديثات عبر Webhook بدل Polling — فلا يوجد أي
+تعارض getUpdates إطلاقاً.
+
+### المتغيرات على Vercel (Dashboard → Project → Settings → Environment Variables)
+```
+TELEGRAM_BOT_TOKEN=...
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
+OWNER_TELEGRAM_ID=...
+ACCOUNTANT_TELEGRAM_ID=...     # اختياري
+WEBHOOK_SECRET_TOKEN=...       # اختياري لكن موصى به بقوة
+```
+
+### خطوات الرفع
+1. اربط المستودع بـ Vercel (Import Project) — سيكتشف `vercel.json` و `api/`.
+2. بعد النشر، افتح مرة واحدة من المتصفح:
+   ```
+   https://<project>.vercel.app/api/webhook
+   ```
+   فيُسجَّل عنوان الـ Webhook تلقائياً لدى تليجرام (مع الرمز السري إن كان مضبوطاً).
+3. البوت جاهز. أي تحديث من تليجرام يصل عبر `POST /api/webhook`.
+
+> ⚠️ لرفع نسخة واحدة فقط: لا تشغّل `python -m app.main` (Polling) محلياً أو
+> على منصة أخرى بنفس التوكن — ستتعارض مع الـ Webhook.
+
+### تنبيه العملاء غير النشطين (Vercel Cron)
+يعمل عبر `api/alert.py` مجدولاً في `vercel.json` **مرة يومياً** عند 09:00 UTC
+(الحد الأقصى المتاح على خطة Vercel Hobby المجانية هو مهمة يومية).
+الدالة تتحقق من يوم الأسبوع المفضّل فلا يُرسل التنبيه إلا عند استحقاقه.
+لضمان التطابق: اضبط `weekly_alert_time` في البوت على ساعة مبكرة (مثل 09:00)
+كي يحقّق التوقيت المحلي الشرط عند استدعاء الـ Cron اليومي.
+
+
+## ⚙️ وضع Webhook (تشغيل دائم — Render/Fly)
 اضبط `WEBHOOK_URL` (عنوانك HTTPS) واختيارياً `WEBHOOK_SECRET_TOKEN` في المتغيرات؛
 عندها يُشغَّل التطبيق عبر `app.run_webhook` بدل Polling.
 
