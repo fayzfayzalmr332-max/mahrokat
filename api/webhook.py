@@ -73,10 +73,28 @@ async def _ensure_ready() -> None:
 
 async def _set_webhook(url: str) -> dict:
     await _ensure_ready()
-    await get_application().bot.set_webhook(
-        url=url, secret_token=_webhook_secret()
-    )
+    try:
+        await get_application().bot.set_webhook(
+            url=url, secret_token=_webhook_secret()
+        )
+    finally:
+        # دورة حياة كاملة لكل طلب (Serverless): كل loop له عملاء شبكة طازة
+        await _safe_shutdown(get_application())
     return {"ok": True, "url": url, "secret": "enabled"}
+
+
+async def _safe_shutdown(application) -> None:
+    """إغلاق موارد التطبيق في نهاية كل طلب.
+
+    في بيئة Serverless كل طلب يعمل على event loop جديد يُغلق بعده؛ إن بقيت
+    عملاء httpx مربوطة بـ loop مُغلق فشل كل طلب لاحق على العقدة الدافئة
+    بخطأ «Event loop is closed». الإغلاق ثم إعادة التهيئة لكل طلب هو النمط
+    الرسمي الموصى به لـ PTB في Serverless (Lambda/Vercel).
+    """
+    try:
+        await application.shutdown()
+    except Exception:  # noqa: BLE001
+        logger.exception("تعذّر إغلاق موارد التطبيق (سيُعاد تهيئتها في الطلب التالي)")
 
 
 async def _process_update(payload: dict) -> None:
@@ -96,6 +114,8 @@ async def _process_update(payload: dict) -> None:
                 await persistence.flush()
             except Exception:  # noqa: BLE001
                 logger.exception("فشل حفظ الحالة بعد معالجة التحديث")
+        # ثم إغلاق موارد الشبكة المرتبطة بالـ loop الحالي (انظر _safe_shutdown)
+        await _safe_shutdown(application)
 
 
 app = Flask(__name__)

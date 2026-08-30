@@ -71,12 +71,16 @@ def test_webhook_processes_real_update(monkeypatch):
             self.bot = DummyBot()
             self.persistence = DummyPersistence()
             self.processed = []
+            self.shutdown_called = False
 
         async def initialize(self):
             return None
 
         async def process_update(self, update):
             self.processed.append(update)
+
+        async def shutdown(self):
+            self.shutdown_called = True
 
     dummy = DummyApp()
     monkeypatch.setattr(m, "get_application", lambda: dummy)
@@ -103,6 +107,9 @@ def test_webhook_processes_real_update(monkeypatch):
     assert dummy.processed[0].update_id == 1
     # الحالة (Persistence) يجب أن تُحفظ بعد كل تحديث
     assert dummy.persistence.flushed is True
+    # دورة الحياة الكاملة: يجب إغلاق الموارد بعد كل طلب (Serverless) —
+    # يمنع انحدار «Event loop is closed» على العقد الدافئة
+    assert dummy.shutdown_called is True
 
 
 def test_webhook_auto_provisions_secret_from_db(monkeypatch):
@@ -179,6 +186,62 @@ def test_alert_accepts_vercel_cron_header(monkeypatch):
     assert resp.status_code == 200
     assert resp.get_json()["ok"] is True
     assert called["n"] == 1
+
+
+def test_application_lifecycle_across_event_loops(monkeypatch):
+    """طلبان متتاليان لكلٍّ منهما event loop خاص (وضع Vercel الدافئ) مع تطبيق
+    PTB حقيقي — يمنع انحدار:
+    «Unknown error in HTTP implementation: RuntimeError(Event loop is closed)».
+    """
+    import asyncio  # noqa: PLC0415
+
+    import api.webhook as m  # noqa: PLC0415
+    from app.bot import build_application  # noqa: PLC0415
+    from telegram.ext._extbot import ExtBot  # noqa: PLC0415
+
+    import app.persistence as pmod  # noqa: PLC0415
+
+    store: dict = {}
+    monkeypatch.setattr(pmod.db, "get_setting", lambda key: store.get(key, ""))
+    monkeypatch.setattr(
+        pmod.db, "set_setting", lambda key, value: store.__setitem__(key, value)
+    )
+
+    app = build_application(settings)
+    monkeypatch.setattr(m, "get_application", lambda: app)
+    monkeypatch.setattr(m, "_webhook_secret", lambda: "s3cr3t")
+
+    async def fake_post(self, endpoint, data=None, *a, **k):  # noqa: ANN001, ANN202
+        if endpoint == "getMe":
+            return {"id": 1, "is_bot": True, "first_name": "X", "username": "x_bot"}
+        return {
+            "message_id": 1,
+            "date": 1700000000,
+            "chat": {"id": 1, "type": "private"},
+            "from": {"id": 1, "is_bot": True, "first_name": "b"},
+            "text": "",
+        }
+
+    monkeypatch.setattr(ExtBot, "_post", fake_post)
+
+    payload = {
+        "update_id": 1,
+        "message": {
+            "message_id": 1,
+            "from": {"id": 123, "is_bot": False, "first_name": "o"},
+            "chat": {"id": 123, "type": "private", "first_name": "o"},
+            "text": "/cancel",
+            "date": 1700000000,
+        },
+    }
+
+    # طلبان متتاليان — كل asyncio.run يعمل على loop جديد يُغلق بعده.
+    # قبل الإصلاح كان الطلب الثاني يفشل بـ «Event loop is closed».
+    for _ in range(2):
+        asyncio.run(m._process_update(payload))
+
+    # الحالة دُوّرت عبر الأقراص (flush) خلال الدورة
+    assert "ptb_persistence_v1" in store
 
 
 def test_alert_accepts_bearer_cron_secret(monkeypatch):

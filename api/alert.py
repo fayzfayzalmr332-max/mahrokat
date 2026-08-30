@@ -51,9 +51,17 @@ def _is_authorized_cron() -> tuple[bool, str]:
 async def _run_alert() -> None:
     application = get_application()
     await application.initialize()  # idempotent
-    # SimpleNamespace يحاكي context الذي تتوقعه _weekly_alert_job
-    context = SimpleNamespace(bot=application.bot, bot_data={})
-    await _weekly_alert_job(context)
+    try:
+        # SimpleNamespace يحاكي context الذي تتوقعه _weekly_alert_job
+        context = SimpleNamespace(bot=application.bot, bot_data={})
+        await _weekly_alert_job(context)
+    finally:
+        # دورة حياة كاملة لكل استدعاء (Serverless): إغلاق عملاء الشبكة
+        # المرتبطة بالـ loop الحالي حتى لا تفشل الاستدعاءات الدافئة اللاحقة.
+        try:
+            await application.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.exception("تعذّر إغلاق موارد التطبيق بعد التنبيه")
 
 
 app = Flask(__name__)
