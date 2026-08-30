@@ -61,9 +61,13 @@ CALLBACK_HIST_PREFIX = "hist:"
 CALLBACK_ACC_ADD_PREFIX = "accadd:"
 CALLBACK_ACC_DEL_PREFIX = "accdel:"
 
-# أزرار تصفير البيانات (تأكيد مزدوج)
-CALLBACK_RESET_CONFIRM = "reset_confirm"
-CALLBACK_RESET_YES = "reset_yes"
+# أزرار تصفير البيانات — نظام تأكيد مزدوج بمستويين:
+# 1) reset_no → إلغاء    2) resetmode:soft|full → اختيار نمط التصفير
+# 3) resetyes:soft|full → تأكيد نهائي ثم تنفيذ
+CALLBACK_RESET_MODE_SOFT = "resetmode:soft"   # تصفير الحسابات (إبقاء العملاء)
+CALLBACK_RESET_MODE_FULL = "resetmode:full"   # مسح شامل (العملاء أيضاً)
+CALLBACK_RESET_YES_SOFT = "resetyes:soft"
+CALLBACK_RESET_YES_FULL = "resetyes:full"
 CALLBACK_RESET_NO = "reset_no"
 
 # قائمة الأوامر الرسمية (تظهر في قائمة Menu بتليجرام للمالك والمحاسب)
@@ -75,7 +79,10 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("paid", "🟢 السداد"),
     BotCommand("today", "📅 تقرير اليوم"),
     BotCommand("top", "🏆 أكبر المدينين"),
+    BotCommand("aging", "⏳ أعمار الديون"),
+    BotCommand("report", "📅 التقرير الشهري"),
     BotCommand("stats", "📊 الإحصائيات"),
+    BotCommand("whoami", "🪪 هويتي وصلاحيتي"),
     BotCommand("account", "🧮 الصندوق المحاسبي"),
     BotCommand("alerts", "🔕 التنبيهات"),
     BotCommand("history", "🧾 سجل عميل"),
@@ -229,44 +236,108 @@ async def _set_my_commands(bot) -> None:
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """تصفير جميع البيانات — الخطوة الأولى من التأكيد المزدوج (للمالك فقط)."""
+    """تصفير البيانات — الخطوة الأولى: اختيار نمط التصفير (للمالك فقط)."""
     if not is_owner(update):
         await _guard(update)
         return ConversationHandler.END
     kb = inline_kb(
         [
-            ("🗑️ متابعة التصفير", CALLBACK_RESET_CONFIRM),
+            ("🧹 تصفير الحسابات (إبقاء العملاء)", CALLBACK_RESET_MODE_SOFT),
+            ("🧨 مسح شامل (حذف العملاء أيضاً)", CALLBACK_RESET_MODE_FULL),
             ("❌ إلغاء", CALLBACK_RESET_NO),
         ]
     )
     await update.effective_message.reply_text(
-        "⚠️ *تحذير: تصفير جميع البيانات*\n\n"
-        "سيتم حذف نهائي لكل:\n"
-        "• العملاء وأرصدتهم\n"
-        "• كل المعاملات والسجلات\n"
-        "• القيود المحاسبية وإعدادات التنبيه\n\n"
-        "لا يمكن التراجع عن هذه العملية. هل تريد المتابعة؟",
+        "🗑️ *تصفير البيانات*\n\n"
+        "اختر نمط التصفير — العملية لا يمكن التراجع عنها:\n\n"
+        "🧹 *تصفير الحسابات*: حذف كل المعاملات والقيود المحاسبية، "
+        "وتصفير أرصدة العملاء مع *إبقاء أسمائهم* في الدفتر.\n\n"
+        "🧨 *المسح الشامل*: حذف *كل شيء* — العملاء والمعاملات والقيود.",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb,
     )
     return ConversationHandler.END
 
 
-async def _reset_execute(update: Update) -> None:
-    """ينفّذ التصفير بعد التأكيد النهائي."""
+async def _reset_guard_query(update: Update) -> bool:
+    """حماية المالك لأزرار التصفير — الأزرار التدميرية للمالك حصراً."""
+    user = update.effective_user if update else None
+    if user and user.id == env_settings.owner_telegram_id:
+        return False
+    query = update.callback_query if update else None
+    if query:
+        await _safe_answer(query, "🚫 هذا الإجراء للمالك فقط", show_alert=True)
+    return True
+
+
+async def _reset_confirm_mode(update: Update, mode: str) -> None:
+    """الخطوة الثانية: تأكيد نهائي للنمط المختار."""
     query = update.callback_query
     await _safe_answer(query)
-    try:
-        counts = db.reset_all_data()
-        await _safe_edit(
-            query,
-            "🗑️ *تم تصفير جميع البيانات بنجاح*\n\n"
-            f"• تم حذف: {counts['customers']} عميل\n"
-            f"• {counts['transactions']} معاملة\n"
-            f"• {counts['account_entries']} قيد محاسبي\n\n"
-            "النظام الآن فارغ وجاهز لبدء جديد. ✅",
-            parse_mode=ParseMode.MARKDOWN,
+    if await _reset_guard_query(update):
+        return
+    if mode == "soft":
+        kb = inline_kb(
+            [
+                ("🧹 نعم، صفّر الحسابات", CALLBACK_RESET_YES_SOFT),
+                ("❌ إلغاء", CALLBACK_RESET_NO),
+            ]
         )
+        text = (
+            "🧹 *تأكيد تصفير الحسابات*\n\n"
+            "سيتم حذف نهائي لـ:\n"
+            "• كل المعاملات (الديون والسداد)\n"
+            "• كل القيود المحاسبية\n\n"
+            "وسيبقى دفتر العملاء بأسمائهم وأرصدتهم تصفّر للصفر.\n\n"
+            "هل أنت متأكد؟"
+        )
+    else:
+        kb = inline_kb(
+            [
+                ("🧨 نعم، امسح كل شيء", CALLBACK_RESET_YES_FULL),
+                ("❌ إلغاء", CALLBACK_RESET_NO),
+            ]
+        )
+        text = (
+            "🧨 *تأكيد المسح الشامل*\n\n"
+            "سيتم حذف نهائي لـ:\n"
+            "• العملاء وأرصدتهم\n"
+            "• كل المعاملات والسجلات\n"
+            "• كل القيود المحاسبية\n\n"
+            "لا يمكن التراجع. هل أنت متأكد تماماً؟"
+        )
+    await _safe_edit(query, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+
+async def _reset_execute(update: Update, mode: str) -> None:
+    """ينفّذ التصفير بعد التأكيد النهائي حسب النمط المختار."""
+    query = update.callback_query
+    await _safe_answer(query)
+    if await _reset_guard_query(update):
+        return
+    try:
+        if mode == "soft":
+            counts = db.reset_accounts_only()
+            await _safe_edit(
+                query,
+                "🧹 *تم تصفير الحسابات بنجاح*\n\n"
+                f"• تم حذف: {counts['transactions']} معاملة\n"
+                f"• {counts['account_entries']} قيد محاسبي\n"
+                "• دفتر العملاء بقى كما هو (الأرصدة = 0)\n\n"
+                "دورة جديدة جاهزة. ✅",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            counts = db.reset_all_data()
+            await _safe_edit(
+                query,
+                "🧨 *تم المسح الشامل بنجاح*\n\n"
+                f"• تم حذف: {counts['customers']} عميل\n"
+                f"• {counts['transactions']} معاملة\n"
+                f"• {counts['account_entries']} قيد محاسبي\n\n"
+                "النظام الآن فارغ وجاهز لبدء جديد. ✅",
+                parse_mode=ParseMode.MARKDOWN,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تصفير البيانات")
         await _safe_edit(query, f"خطأ في التصفير: {str(exc)}")
@@ -376,7 +447,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]
     await update.effective_message.reply_text(
         "📟 أرسل نصاً مباشرة مثل 'دين محمد 50' أو 'حساب محمد'،\n"
-        "أو /menu للوحة التحكم الكاملة بأزرار سريعة.",
+        "أو /menu للوحة التحكم الكاملة بأزرار سريعة.\n\n"
+        "📊 تقارير ذكية: /report (شهري مقارن) · /aging (أعمار الديون)\n"
+        "🪪 /whoami لمعرفة صلاحيتك · /reset للتصفير (المالك فقط).",
         reply_markup=InlineKeyboardMarkup(kb),
     )
     return ConversationHandler.END
@@ -810,6 +883,17 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     await _safe_answer(query)
 
+    # ── أزرار التصفير (تأكيد مزدوج بمستويين — للمالك حصراً داخل المعالجات) ──
+    if data in (CALLBACK_RESET_MODE_SOFT, CALLBACK_RESET_MODE_FULL):
+        await _reset_confirm_mode(update, data.split(":", 1)[1])
+        return
+    if data in (CALLBACK_RESET_YES_SOFT, CALLBACK_RESET_YES_FULL):
+        await _reset_execute(update, data.split(":", 1)[1])
+        return
+    if data == CALLBACK_RESET_NO:
+        await _safe_edit(query, "تم الإلغاء. لم يُحذف أي شيء. ✅")
+        return
+
     if data == CALLBACK_QUICK:
         customers = context.user_data.get("last_customers")
         if not customers:
@@ -866,6 +950,8 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "paid": cmd_paid,
             "today": cmd_today,
             "top": cmd_top,
+            "aging": cmd_aging,
+            "report": cmd_report,
             "list": cmd_list,
             "stats": cmd_stats,
             "account": cmd_account,
@@ -938,6 +1024,104 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
 
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """التقرير الذكي الشهري: هذا الشهر مقابل الشهر الماضي + معدل السداد."""
+    if not is_authorized(update):
+        await _guard(update)
+        return ConversationHandler.END
+    try:
+        r = db.monthly_report()
+        this_m, prev_m = r["this"], r["prev"]
+
+        def delta(cur, old) -> str:
+            if old == 0:
+                return "─"
+            pct = ((cur - old) / old) * 100
+            arrow = "📈" if pct >= 0 else "📉"
+            return f"{arrow} {pct:+.0f}%"
+
+        table = _mono_table(
+            ["البند", "هذا الشهر", "الماضي"],
+            [
+                ["ديون", _fmt_money(this_m["debts"]), _fmt_money(prev_m["debts"])],
+                ["سداد", _fmt_money(this_m["paid"]), _fmt_money(prev_m["paid"])],
+                ["عمليات", str(this_m["count"]), str(prev_m["count"])],
+            ],
+        )
+        rate = r["payment_rate"]
+        rate_line = (
+            f"🎯 معدل سداد هذا الشهر: *{rate}%*" if rate is not None else "🎯 لا ديون هذا الشهر بعد"
+        )
+        d_debt = _md2(delta(this_m["debts"], prev_m["debts"]))
+        d_paid = _md2(delta(this_m["paid"], prev_m["paid"]))
+        await update.effective_message.reply_text(
+            f"📅 *التقرير الشهري الذكي*\n\n{table}\n\n"
+            f"{rate_line}\n"
+            f"💵 ديون: {d_debt}   سداد: {d_paid}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("فشل التقرير الشهري")
+        await update.effective_message.reply_text(f"خطأ في التقرير الشهري: {str(exc)}")
+    return ConversationHandler.END
+
+
+async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """أعمار الديون — ذكاء التحصيل: من لا يُطالَبه منذ متى؟"""
+    if not is_authorized(update):
+        await _guard(update)
+        return ConversationHandler.END
+    try:
+        r = db.aging_report()
+        if not r["rows"]:
+            await update.effective_message.reply_text("🎉 لا يوجد مدينون أصلاً.")
+            return ConversationHandler.END
+        table = _mono_table(
+            ["العميل", "الرصيد", "آخر حركة"],
+            [
+                [_md(c["name"]), _fmt_money(c["balance"]), f"{c['days']} يوم" if c["days"] >= 0 else "؟"]
+                for c in r["rows"][:15]
+            ],
+        )
+        buckets = r["buckets"]
+        summary = " · ".join(
+            f"{label}: {len(names)}" for label, names in buckets.items() if names
+        )
+        await update.effective_message.reply_text(
+            f"⏳ *أعمار الديون* (الأقدم أولاً)\n\n{table}\n\n"
+            f"🗂️ الشرائح: {summary}\n"
+            f"💼 إجمالي: *{_fmt_money_md2(r['total'])}*\n\n"
+            "💡 ابدأ التحصيل بأصحاب الديون المتقادمة.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("فشل تقرير أعمار الديون")
+        await update.effective_message.reply_text(f"خطأ في أعمار الديون: {str(exc)}")
+    return ConversationHandler.END
+
+
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """هويتي وصلاحيتي في النظام."""
+    user = update.effective_user
+    if not user:
+        return ConversationHandler.END
+    if user.id == env_settings.owner_telegram_id:
+        role, icon = "👑 المالك", "كل الصلاحيات (بما فيها التصفير والاستعادة)"
+    elif _is_authorized_user(user.id):
+        role, icon = "🧾 المحاسب", "تشغيلية كاملة (بدون التصفير والاستعادة)"
+    else:
+        role, icon = "🚫 غير مخوّل", "لا توجد صلاحيات"
+    await update.effective_message.reply_text(
+        f"🪪 *هويتي*\n\n"
+        f"• الاسم: {_md(user.first_name)}\n"
+        f"• المعرّف: `{user.id}`\n"
+        f"• الصلاحية: *{role}*\n"
+        f"• النطاق: {icon}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ConversationHandler.END
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """عرض إحصائيات عامة محسوبة بحذر."""
     if not is_authorized(update):
@@ -945,16 +1129,27 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     try:
         s = db.stats()
-        table = _mono_table(
-            ["البند", "القيمة"],
-            [
-                ["👥 العملاء", str(s["customers"])],
-                ["🔄 المعاملات", str(s["transactions"])],
-                ["💰 إجمالي الديون", _fmt_money(s["total_debts"])],
-                ["✅ إجمالي السداد", _fmt_money(s["total_paid"])],
-                ["⚖️ الصافي", _fmt_money(s["total_balance"])],
-            ],
+        try:
+            _, debtors = db.list_debtors()
+            debtors_count = len(debtors)
+        except Exception:  # noqa: BLE001
+            debtors_count = None
+        rate = (
+            f"{(s['total_paid'] / s['total_debts'] * 100):.1f}%"
+            if s["total_debts"] > 0
+            else "─"
         )
+        rows = [
+            ["👥 العملاء", str(s["customers"])],
+            ["🔄 المعاملات", str(s["transactions"])],
+            ["💰 إجمالي الديون", _fmt_money(s["total_debts"])],
+            ["✅ إجمالي السداد", _fmt_money(s["total_paid"])],
+            ["⚖️ الصافي", _fmt_money(s["total_balance"])],
+            ["🎯 معدل السداد", rate],
+        ]
+        if debtors_count is not None:
+            rows.append(["🔴 مدينون نشطون", str(debtors_count)])
+        table = _mono_table(["البند", "القيمة"], rows)
         await update.effective_message.reply_text(
             f"📊 *إحصائيات عامة*\n\n{table}",
             parse_mode=ParseMode.MARKDOWN_V2,
@@ -1147,6 +1342,10 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         [
             InlineKeyboardButton("📅 تقرير اليوم", callback_data=f"{CALLBACK_MENU_PREFIX}today"),
             InlineKeyboardButton("🏆 أكبر المدينين", callback_data=f"{CALLBACK_MENU_PREFIX}top"),
+        ],
+        [
+            InlineKeyboardButton("📅 التقرير الشهري", callback_data=f"{CALLBACK_MENU_PREFIX}report"),
+            InlineKeyboardButton("⏳ أعمار الديون", callback_data=f"{CALLBACK_MENU_PREFIX}aging"),
         ],
         [
             InlineKeyboardButton("🗂️ قائمة العملاء", callback_data=f"{CALLBACK_MENU_PREFIX}list"),
@@ -1692,7 +1891,12 @@ def build_application(settings: Settings) -> Application:
     # الأوامر الإدارية
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("aging", cmd_aging))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("history", cmd_history))
+    # التصفير (للمالك فقط — تأكيد مزدوج بمستويين عبر الأزرار)
+    app.add_handler(CommandHandler("reset", cmd_reset))
     # الميزات التحليلية
     app.add_handler(CommandHandler("debts", cmd_debts))
     app.add_handler(CommandHandler("paid", cmd_paid))
@@ -1711,7 +1915,8 @@ def build_application(settings: Settings) -> Application:
             pattern=(
                 r"^(page:\d+|quick|bal:[0-9a-fA-F-]+|undo:[0-9a-fA-F-]+|"
                 r"undo_cancel|menu:\w+|alert:(on|off|days:\d+)|"
-                r"hist:[0-9a-fA-F-]+:\d+|accadd:(income|expense))$"
+                r"hist:[0-9a-fA-F-]+:\d+|accadd:(income|expense)|"
+                r"resetmode:(soft|full)|resetyes:(soft|full)|reset_no)$"
             ),
         )
     )

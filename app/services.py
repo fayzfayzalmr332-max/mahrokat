@@ -794,6 +794,139 @@ class Database:
 
         logger.warning("تم تصفير جميع البيانات: %s", counts)
         return counts
+
+    def reset_accounts_only(self) -> dict:
+        """تصفير الحسابات مع إبقاء العملاء: حذف المعاملات والقيود المحاسبية فقط.
+
+        الأرصدة مشتقة من المعاملات (RPC/Views) لذا تصفّر تلقائياً بحذفها —
+        مناسب لبداية دورة محاسبية جديدة دون فقدان دفتر العملاء.
+        """
+        def _count(path: str) -> int:
+            try:
+                _, rows = self._req("GET", path, "select=id&limit=10000")
+                return len(rows) if isinstance(rows, list) else 0
+            except RuntimeError as exc:  # noqa: BLE001
+                logger.warning("تعذّر عدّ %s: %s", path, exc)
+                return 0
+
+        counts = {
+            "transactions": _count("transactions"),
+            "customers": 0,  # العملاء يبقون في هذا الوضع
+            "account_entries": _count("account_entries"),
+        }
+        q = urllib.parse.urlencode({"id": f"neq.{_NULL_UUID}"})
+        for path in ("account_entries", "transactions"):
+            try:
+                self._req("DELETE", path, q)
+            except RuntimeError as exc:  # noqa: BLE001
+                logger.warning("فشل تصفير %s: %s", path, exc)
+        logger.warning("تم تصفير الحسابات (بإبقاء العملاء): %s", counts)
+        return counts
+
+    def monthly_report(self, offset_hours: int = 3) -> dict:
+        """تقرير شهري مقارن: هذا الشهر مقابل الشهر الماضي.
+
+        يعيد لكل شهر: إجمالي الديون، السداد، الصافي، وعدد العمليات —
+        مع معدل السداد الإجمالي (سداد هذا الشهر ÷ ديون هذا الشهر).
+        """
+        now_local = datetime.now(timezone.utc) + timedelta(hours=offset_hours)
+
+        def month_start(dt: datetime) -> datetime:
+            return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        def next_month(dt: datetime) -> datetime:
+            m = month_start(dt)
+            return m.replace(year=m.year + 1, month=1) if m.month == 12 else m.replace(month=m.month + 1)
+
+        this_start = month_start(now_local)
+        next_start = next_month(now_local)
+        prev_start = next_month(this_start - timedelta(days=1))
+        prev_end = this_start
+
+        def _range(start_local: datetime, end_local: datetime) -> dict:
+            s_utc = (start_local - timedelta(hours=offset_hours)).isoformat()
+            e_utc = (end_local - timedelta(hours=offset_hours)).isoformat()
+            # شرطان لنفس الحقل: urlencode يقبل قائمة أزواج فتتكرر المفتاح (AND في PostgREST)
+            q = urllib.parse.urlencode(
+                [
+                    ("created_at", f"gte.{s_utc}"),
+                    ("created_at", f"lt.{e_utc}"),
+                    ("select", "amount::text,tx_type"),
+                ]
+            )
+            _, rows = self._req("GET", "transactions", q)
+            debts = Decimal("0.00")
+            paid = Decimal("0.00")
+            for r in rows:
+                amt = to_decimal(r.get("amount", 0))
+                if amt > 0:
+                    debts += amt
+                else:
+                    paid += -amt
+            return {"debts": debts, "paid": paid, "count": len(rows), "net": debts + paid}
+
+        this_m = _range(this_start, next_start)
+        prev_m = _range(prev_start, prev_end)
+        rate = (
+            round((this_m["paid"] / this_m["debts"]) * 100, 1)
+            if this_m["debts"] > 0
+            else None
+        )
+        return {"this": this_m, "prev": prev_m, "payment_rate": rate}
+
+    # شرائح أعمار الديون (بالأيام منذ آخر حركة)
+    _AGING_BUCKETS = ((0, 7, "أسبوع"), (8, 30, "شهر"), (31, 90, "٣ أشهر"), (91, None, "متقادم"))
+
+    def aging_report(self) -> dict:
+        """أعمار الديون: كل مدين + أيام صمت منذ آخر حركة (طلب واحد إضافي فقط).
+
+        يعيد: الصفوف مرتبة (الأقدم أولاً)، الشرائح، وإجمالي الديون —
+        أداة ذكاء تحصيل: مَن يجب مطالبته أولاً.
+        """
+        debtors, total = self.list_debtors()
+        if not debtors:
+            return {"rows": [], "buckets": {}, "total": total}
+
+        ids = ",".join(c["id"] for c in debtors)
+        q = urllib.parse.urlencode(
+            {
+                "customer_id": f"in.({ids})",
+                "select": "customer_id,created_at",
+                "order": "created_at.desc",
+            }
+        )
+        _, rows = self._req("GET", "transactions", q)
+        last_seen: dict[str, str] = {}
+        for r in rows:
+            cid = r.get("customer_id")
+            if cid and cid not in last_seen:
+                last_seen[cid] = str(r.get("created_at", ""))
+
+        now = datetime.now(timezone.utc)
+        out = []
+        buckets: dict[str, list[str]] = {}
+        for c in debtors:
+            raw = last_seen.get(c["id"])
+            if raw:
+                try:
+                    last_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    days = max(0, (now - last_dt).days)
+                except ValueError:
+                    days = -1
+            else:
+                days = -1  # مدين بلا أي معاملة مسجلة (بيانات قديمة)
+            if days < 0:
+                bucket = "غير معروف"
+            else:
+                bucket = next(
+                    (label for lo, hi, label in self._AGING_BUCKETS if lo <= days and (hi is None or days <= hi)),
+                    "متقادم",
+                )
+            out.append({"name": c["name"], "balance": c["balance"], "days": days, "bucket": bucket})
+            buckets.setdefault(bucket, []).append(c["name"])
+        out.sort(key=lambda r: r["days"], reverse=True)
+        return {"rows": out, "buckets": buckets, "total": total}
+
 # ── الإعدادات الديناميكية (app_settings) ──────────────────────
     _SETTING_DEFAULTS = {
         "inactive_days": "30",
