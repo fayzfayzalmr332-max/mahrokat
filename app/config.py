@@ -7,17 +7,7 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from dataclasses import dataclass
-
-# دعم تشغيل محلي اختياري: إن وُجد ملف `.env` في جذر المشروع يُحمَّل
-# (مغلّف في .gitignore ولا يُرفع إلى الريبو إطلاقاً). يُستعمل فقط محلياً/للتجربة.
-try:
-    from dotenv import load_dotenv
-    _DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-    load_dotenv(_DOTENV_PATH, override=False)
-except ImportError:  # في بيئة الاستضافة لا حاجة له — الأسرار من Environment مباشرة
-    pass
 
 
 def _get_required(name: str) -> str:
@@ -48,10 +38,14 @@ class Settings:
     supabase_url: str
     supabase_service_role_key: str
     owner_telegram_id: int
+    accountant_telegram_id: int | None  # معرّف المحاسب (اختياري)
     webhook_url: str
     webhook_secret_token: str | None
     port: int
     log_level: str
+    # ── الإعدادات الاختيارية للميزات الجديدة ──
+    timezone_offset: int  # انحراف الساعة عن UTC بالساعات (مثال: +3)
+    currency: str  # رمز العملة المعروض (اختياري)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -59,16 +53,26 @@ class Settings:
         if not owner_id:
             raise RuntimeError("❌ OWNER_TELEGRAM_ID يجب أن يكون رقماً صحيحاً (Telegram User ID)")
 
+        accountant_id = _get_int("ACCOUNTANT_TELEGRAM_ID")
+        if accountant_id == owner_id:
+            raise RuntimeError(
+                "❌ ACCOUNTANT_TELEGRAM_ID يجب أن يختلف عن OWNER_TELEGRAM_ID"
+            )
+
         port = _get_int("PORT", 8080)
+        timezone_offset = _get_int("TIMEZONE_OFFSET", 3)
         return cls(
             telegram_token=_get_required("TELEGRAM_BOT_TOKEN"),
             supabase_url=_get_required("SUPABASE_URL"),
             supabase_service_role_key=_get_required("SUPABASE_SERVICE_ROLE_KEY"),
             owner_telegram_id=owner_id,
+            accountant_telegram_id=accountant_id,
             webhook_url=os.environ.get("WEBHOOK_URL", "").strip(),
             webhook_secret_token=os.environ.get("WEBHOOK_SECRET_TOKEN", "").strip() or None,
             port=port or 8080,
             log_level=os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO",
+            timezone_offset=timezone_offset or 3,
+            currency=os.environ.get("CURRENCY", "").strip(),
         )
 
 

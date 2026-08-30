@@ -3,7 +3,6 @@
 نظام **Zero-Cost** لإدارة ديون حسابات عملاء محطة وقود عبر بوت تليجرام،
 بالعربية وبإدخال نصي ذكي (NLP)، مع أمان صارم.
 
----
 
 ## 🎯 الميزات
 
@@ -18,7 +17,6 @@
 | التأكيد | لا تُسجَّل أي عملية إلا بعد ردّ "نعم" على رسالة تأكيد |
 | الإنشاء | يُنشأ حساب العميل تلقائياً (UUID) عند أول ذكر لاسمه |
 
----
 
 ## 🗣️ الأنماط النصية المدعومة
 
@@ -53,21 +51,20 @@
 قبل أي بحث، تُوحَّد الأحرف: `أ/إ/آ → ا`، `ة → ه`، `ى/ی → ي`، `ؤ/ئ → ء`، وتُزال التشكيل
 و(ال) التعريف — لمنع أي تكرار مثل «محمد / محمد» أو «علي / على».
 
----
 
 ## 🔐 الأمان
 
-1. **المصادقة**: لا يُقبل أي تفاعل إلا مع `OWNER_TELEGRAM_ID`.
+1. **المصادقة**: لا يُقبل أي تفاعل إلا مع `OWNER_TELEGRAM_ID` (المالك) أو
+   `ACCOUNTANT_TELEGRAM_ID` (المحاسب — اختياري، يملك صلاحيات المالك نفسها).
 2. **RLS مقفول**: الجداول (`customers`, `transactions`) تفعّل Row Level
    Security **دون أي POLICY** — أي وصول من `anon`/`authenticated` مرفوض.
    الوصول الوحيد عبر `role=service_role` من السيرفر فقط.
 3. **الأسرار**: كل المفاتيح تُحقن عبر **Environment Variables** فقط.
-   **ممنوع كتابتها في الكود أو `.env` داخل الريبو**.
+    التطبيق لا يقرأ ملفات `.env`، وممنوع حفظ الأسرار في الكود أو المستودع.
 4. **الأموال**: `numeric(15,2)` فقط، تُنقل كنص نصي دقيق لتفادي أخطاء الطفو.
    الرصيد يُحسب بجمع `Decimal` بالتطبيق من نص القيم من PostgREST.
 5. **التأكيد الإجباري**: لا يوجد سجل مالي قبل `نعم` (نصاً أو زراً)
 
----
 
 ## 🗃️ هيكل المشروع
 
@@ -81,8 +78,11 @@ mahrokat/
 │   └── nlp/
 │       ├── normalization.py  # تطبيع الأسماء العربية
 │       ├── amounts.py        # تحويل النص/الكلمات إلى مبالغ
-│       └── parser.py         # تحليل الجملة إلى دين/دفع/حساب
-├── migrations/001_init.sql   # مخطط DB + RLS (نفّذه أولاً)
+│       └── parser.py         # حلل الجملة إلى دين/دفع/حساب/دخل/مصروف
+├── migrations/
+│   ├── 001_init.sql               # المخطط الأساسي (عملاء + معاملات + RLS)
+│   ├── 002_accountant_alerts.sql  # المحاسبي الشخصي + الإعدادات + التنبيهات
+│   └── 003_hardening.sql          # التحصين: updated_at + قيود مالية + audit_log + Views
 ├── tests/test_core.py        # اختبارات الوحدات
 ├── requirements.txt
 ├── Dockerfile
@@ -91,19 +91,19 @@ mahrokat/
 ├── .env.example              # نموذج فقط — القيم الحقيقية على المنصة
 ```
 
----
 
 ## 🚀 خطوات النشر
 
 ### 1) دريس إعداد Supabase
 1. أنشئ مشروعاً في [Supabase](https://supabase.com).
-2. افتح **SQL Editor** ونفّذ كامل `migrations/001_init.sql`.
+2. افتح **SQL Editor** ونفّذ كامل الملفات بالترتيب:
+   - `migrations/001_init.sql` — المخطط الأساسي
+   - `migrations/002_accountant_alerts.sql` — المحاسبي والصندوق الشخصي والتنبيهات
+   - `migrations/003_hardening.sql` — التحصين الاحترافي (قيود مالية، سجل تدقيق، Views)
 
 ### 2) أنشئ البوت
-- في تليجرام: تحدّث مع [`@BotFather`](https://t.me/BotFather) → `/newbot` → خذ التوكن.
 
 ### 3) إعداد مفتاح المالك
-- تحدّث مع [`@userinfobot`](https://t.me/userinfobot) → سيعطيك `id` رقمي.
 
 ### 4) الرقابة على الأسرار عند الاستضافة — NEVER في الدردشة
 من Dashboard المنصة فقط أدخل المتغيرات:
@@ -114,6 +114,7 @@ mahrokat/
 | `SUPABASE_URL` | `https://xyz.supabase.co` |
 | `SUPABASE_SERVICE_ROLE_KEY` | `eyJhbGciOi...` (key الخدمة `/service_role`) |
 | `OWNER_TELEGRAM_ID` | `123456789` |
+| `ACCOUNTANT_TELEGRAM_ID` | `987654321` *(اختياري)* |
 
 > ⚠️ **مهم**: `SUPABASE_SERVICE_ROLE_KEY` يتجاوز RLS كلياً —
 > عالِجه كأسرار قصوى ولا تشاركه أبداً خارج Dashboard.
@@ -130,13 +131,12 @@ mahrokat/
 ```bash
 fly launch --no-deploy
 fly secrets set TELEGRAM_BOT_TOKEN=... SUPABASE_URL=... \
-               SUPABASE_SERVICE_ROLE_KEY=... OWNER_TELEGRAM_ID=...
+               SUPABASE_SERVICE_ROLE_KEY=... OWNER_TELEGRAM_ID=... \
+               ACCOUNTANT_TELEGRAM_ID=...
 fly deploy
 ```
 
 **الخيار (ج) — Oracle Cloud Free (VM دائماً):**
-- البحث عن دوكر: `docker build -t fuel-bot . && docker run --env-file ...`
-- أو `systemd` + Python.
 
 ### 6) التشغيل محلياً للتجربة (لا للأسرار الحقيقية)
 ```bash
@@ -148,7 +148,6 @@ $env:OWNER_TELEGRAM_ID='123'
 python -m app.main        # Polling تلقائياً
 ```
 
----
 
 ## 🧪 الاختبارات
 
@@ -161,18 +160,13 @@ $env:OWNER_TELEGRAM_ID='123'
 python -m pytest
 ```
 
----
 
 ## ⚙️ وضع Webhook (اختياري)
 اضبط `WEBHOOK_URL` (عنوانك HTTPS) واختيارياً `WEBHOOK_SECRET_TOKEN` في المتغيرات؛
 عندها يُشغَّل التطبيق عبر `app.run_webhook` بدل Polling.
 
----
 
 ## 📌 ملاحظات
-- مبلغ سالب/صفر مرفوض (`amount <> 0` على مستوى DB، ولدينا تحقق في الطبقة مباشرة).
-- أي خطأ في قاعدة البيانات يُسجَّل ويُرسل رسالة ودية بدون تعريض الأسرار.
-- المخطط مؤمَّن: لا ننشئ أي policy — إن احتجت عرضاً عاماً لاحقاً، أنشئ سياسة
   محدودة ومدروسة فقط.
 
 سياسة النشر Safe & Secure: **صفر أسرار في الدردشة/الريبو**، RLS مغلق، مبالغ عشرية

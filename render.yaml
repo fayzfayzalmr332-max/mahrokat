@@ -22,5 +22,7 @@ services:
         sync: false
       - key: OWNER_TELEGRAM_ID
         sync: false
+      - key: ACCOUNTANT_TELEGRAM_ID
+        sync: false
       - key: LOG_LEVEL
         value: INFO
