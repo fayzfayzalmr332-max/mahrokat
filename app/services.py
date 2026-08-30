@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 MAX_MONEY = Decimal("9999999999999.99")
 DECIMAL_PLACES = Decimal("0.01")
 
+# معرّف UUID مستحيل عملياً — يُستخدم كفلتر حذف شامل في PostgREST
+_NULL_UUID = "00000000-0000-0000-0000-000000000000"
+
 
 def to_decimal(value: object) -> Decimal:
     """تحويل آمن لأي قيمة إلى Decimal بحسم إلى منزلتين عشريتين (15,2)."""
@@ -668,7 +671,15 @@ class Database:
             return None
 
     def get_account_balance(self) -> Decimal:
-        """رصيد الصندوق الشخصي = مجموع(دخل) − مجموع(مصروف)."""
+        """رصيد الصندوق الشخصي = مجموع(دخل) − مجموع(مصروف) — طلب واحد عبر View."""
+        try:
+            q = urllib.parse.urlencode({"select": "balance::text", "limit": "1"})
+            _, rows = self._req("GET", "v_account_totals", q)
+            if rows:
+                return to_decimal(rows[0].get("balance") or 0)
+        except RuntimeError as exc:  # noqa: BLE001
+            logger.warning("تعذّر استخدام v_account_totals (%s) — مسار بديل قديم", exc)
+        # مسار بديل قديم (قاعدة بدون 004)
         _, rows = self._req("GET", "account_entries", "select=amount::text,entry_type")
         income = Decimal("0.00")
         expense = Decimal("0.00")
@@ -710,36 +721,36 @@ class Database:
         return rows or []
 
     def account_stats(self, days: int = 30) -> dict:
-        """إحصائيات المحاسبي خلال آخر أيام (افتراضياً 30)."""
+        """إحصائيات المحاسبي خلال آخر أيام — استعلام مفلتر بالتاريخ (أسرع)."""
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         q = urllib.parse.urlencode(
             {
-                "select": "entry_type,amount::text,category,created_at,note",
+                "select": "entry_type,amount::text,category",
                 "order": "created_at.desc",
+                "created_at": f"gte.{since}",
             }
         )
-        _, rows = self._req("GET", "account_entries", q)
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:19]
+        rows: list = []
+        try:
+            _, rows = self._req("GET", "account_entries", q)
+        except RuntimeError as exc:  # noqa: BLE001
+            logger.warning("فشل جلب إحصائيات المحاسبي (%s)", exc)
         income = Decimal("0.00")
         expense = Decimal("0.00")
         count = 0
         by_category: dict[str, Decimal] = {}
         for r in rows:
-            created = (r.get("created_at") or "")[:19]
-            if created < since:
-                continue
             amt = to_decimal(r.get("amount", 0))
             count += 1
             if r.get("entry_type") == "income":
                 income += amt
-            else:
-                expense += amt
+                continue
+            expense += amt
             category = (r.get("category") or "أخرى").strip() or "أخرى"
             by_category[category] = by_category.get(category, Decimal("0.00")) + amt
 
         top_expense = sorted(
-            ((k, v) for k, v in by_category.items() if k != "income"),
-            key=lambda x: x[1],
-            reverse=True,
+            by_category.items(), key=lambda x: x[1], reverse=True
         )[:5]
         return {
             "count": count,
@@ -748,6 +759,41 @@ class Database:
             "net": income - expense,
             "top_categories": top_expense,
         }
+
+    def reset_all_data(self) -> dict:
+        """تصفير كل بيانات المحطة نهائياً (عملاء + معاملات + محاسبي).
+
+        مسؤولة وخطيرة — لا تُستدعى إلا بعد تأكيد مزدوج صريح من المالك/المحاسب.
+        ترتيب الحذف يحترم القيود المرجعية: القيود المحاسبية ← المعاملات ← العملاء.
+        """
+        def _count(path: str) -> int:
+            try:
+                _, rows = self._req("GET", path, "select=id&limit=10000")
+                return len(rows) if isinstance(rows, list) else 0
+            except RuntimeError as exc:  # noqa: BLE001
+                logger.warning("تعذّر عدّ %s: %s", path, exc)
+                return 0
+
+        counts = {
+            "transactions": _count("transactions"),
+            "customers": _count("customers"),
+            "account_entries": _count("account_entries"),
+        }
+
+        # PostgREST يرفض DELETE بلا فلتر؛ id=neq.zero يطابق كل الصفوف الفعلية
+        q = urllib.parse.urlencode({"id": f"neq.{_NULL_UUID}"})
+        for path in ("account_entries", "transactions", "customers"):
+            try:
+                self._req("DELETE", path, q)
+            except RuntimeError as exc:  # noqa: BLE001
+                logger.warning("فشل تصفير %s: %s", path, exc)
+
+        # إعادة ضبط الإعدادات الديناميكية إلى القيم الافتراضية
+        for key, value in self._SETTING_DEFAULTS.items():
+            self.set_setting(key, value)
+
+        logger.warning("تم تصفير جميع البيانات: %s", counts)
+        return counts
 # ── الإعدادات الديناميكية (app_settings) ──────────────────────
     _SETTING_DEFAULTS = {
         "inactive_days": "30",

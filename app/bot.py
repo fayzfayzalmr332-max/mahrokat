@@ -16,7 +16,14 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -32,6 +39,7 @@ from telegram.ext import (
 from app.config import Settings, settings as env_settings
 from app.errors import is_conflict_error, is_harmless_error, is_infrastructure_error
 from app.nlp.parser import parse_message
+from app.persistence import SupabasePersistence
 from app.services import db, to_decimal
 
 logger = logging.getLogger(__name__)
@@ -52,6 +60,32 @@ CALLBACK_ALERT_PREFIX = "alert:"
 CALLBACK_HIST_PREFIX = "hist:"
 CALLBACK_ACC_ADD_PREFIX = "accadd:"
 CALLBACK_ACC_DEL_PREFIX = "accdel:"
+
+# أزرار تصفير البيانات (تأكيد مزدوج)
+CALLBACK_RESET_CONFIRM = "reset_confirm"
+CALLBACK_RESET_YES = "reset_yes"
+CALLBACK_RESET_NO = "reset_no"
+
+# قائمة الأوامر الرسمية (تظهر في قائمة Menu بتليجرام للمالك والمحاسب)
+_BOT_COMMANDS: list[BotCommand] = [
+    BotCommand("start", "🏠 الرئيسية"),
+    BotCommand("menu", "🚀 مركز القيادة"),
+    BotCommand("list", "🗂️ قائمة العملاء"),
+    BotCommand("debts", "🔴 الديون المستحقة"),
+    BotCommand("paid", "🟢 السداد"),
+    BotCommand("today", "📅 تقرير اليوم"),
+    BotCommand("top", "🏆 أكبر المدينين"),
+    BotCommand("stats", "📊 الإحصائيات"),
+    BotCommand("account", "🧮 الصندوق المحاسبي"),
+    BotCommand("alerts", "🔕 التنبيهات"),
+    BotCommand("history", "🧾 سجل عميل"),
+    BotCommand("search", "🔍 بحث بالاسم"),
+    BotCommand("undo", "↩️ تراجع عن عملية"),
+    BotCommand("export", "📄 تصدير CSV"),
+    BotCommand("backup", "💾 نسخ احتياطي"),
+    BotCommand("restore", "📤 استعادة نسخة"),
+    BotCommand("reset", "🗑️ تصفير البيانات"),
+]
 
 
 def inline_kb(buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
@@ -91,6 +125,13 @@ def is_authorized(update: Update) -> bool:
     return _is_authorized_user(update.effective_user.id)
 
 
+def is_owner(update: Update) -> bool:
+    """تحقق حصري للمالك — للأوامر التدميرية (تصفير/استعادة)."""
+    if not update or not update.effective_user:
+        return False
+    return update.effective_user.id == env_settings.owner_telegram_id
+
+
 def _fmt_money(value) -> str:
     d = to_decimal(value)
     cur = (env_settings.currency or "").strip()
@@ -102,7 +143,39 @@ def _md(text: object) -> str:
     return str(text or "").translate(_MD_SPECIALS)
 
 
+def _md2(text: object) -> str:
+    """هروب النصوص الديناميكية لصيغة MarkdownV2 (حروف إضافية أكثر)."""
+    return str(text or "").translate(_MD2_SPECIALS)
+
+
+def _fmt_money_md2(value) -> str:
+    """تنسيق مبلغ آمن للدمج داخل رسالة MarkdownV2."""
+    return _md2(_fmt_money(value))
+
+
+def _mono_table(header: list[str], rows: list[list[str]]) -> str:
+    """جدول مبسط داخل كتلة كود MarkdownV2 — مقروء وثابت المحاذاة."""
+    widths = [len(h) for h in header]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(cell or ""))
+    widths = [min(w, 38) for w in widths]
+
+    def fmt(cells: list[str]) -> str:
+        parts = []
+        for i, w in enumerate(widths):
+            cell = (cells[i] if i < len(cells) else "") or ""
+            parts.append(cell[:w].ljust(w))
+        return "| " + " | ".join(parts) + " |"
+
+    sep = "|" + "|".join("-" * (w + 2) for w in widths) + "|"
+    lines = [fmt(header), sep] + [fmt(r) for r in rows]
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
 _MD_SPECIALS = str.maketrans({c: "\\" + c for c in "\\*_`[~"})
+# أحرف MarkdownV2 التي يجب حجزها في النص الخارجي (خارج كتل الكود)
+_MD2_SPECIALS = str.maketrans({c: "\\" + c for c in "\\_*[]()~`>#+-=|{}.!"})
 
 
 def _action_label(action: str | None) -> str:
@@ -120,6 +193,83 @@ def _confirm_keyboard() -> InlineKeyboardMarkup:
         ]
     ]
     return InlineKeyboardMarkup(kb)
+
+
+# أوامر تدميرية — تظهر في القائمة وتُنفَّذ للمالك فقط
+_OWNER_ONLY_COMMANDS = {"reset", "restore"}
+
+
+def _commands_for(owner: bool) -> list[BotCommand]:
+    """قائمة الأوامر حسب الصلاحية: المالك الكاملة، والمحاسب التشغيلية."""
+    if owner:
+        return list(_BOT_COMMANDS)
+    return [c for c in _BOT_COMMANDS if c.command not in _OWNER_ONLY_COMMANDS]
+
+
+async def _set_my_commands(bot) -> None:
+    """يعيّن قائمة الأوامر الرسمية في تليجرام ديناميكياً حسب صلاحية كل مستخدم:
+
+    - المالك: القائمة الكاملة (بما فيها /reset و /restore).
+    - المحاسب: القائمة التشغيلية بدون الأوامر التدميرية.
+    يُستدعى بعد النشر (عبر GET /api/webhook) وفي post_init.
+    """
+    try:
+        ids = _authorized_ids()
+        await bot.set_my_commands(
+            _commands_for(True), scope=BotCommandScopeDefault()
+        )
+        for uid in ids:
+            owner = uid == env_settings.owner_telegram_id
+            await bot.set_my_commands(
+                _commands_for(owner), scope=BotCommandScopeChat(chat_id=uid)
+            )
+        logger.info("تم تعيين قائمة الأوامر الرسمية لـ %d مستخدم مخوّل", len(ids))
+    except Exception:  # noqa: BLE001
+        logger.exception("فشل تعيين قائمة الأوامر الرسمية")
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """تصفير جميع البيانات — الخطوة الأولى من التأكيد المزدوج (للمالك فقط)."""
+    if not is_owner(update):
+        await _guard(update)
+        return ConversationHandler.END
+    kb = inline_kb(
+        [
+            ("🗑️ متابعة التصفير", CALLBACK_RESET_CONFIRM),
+            ("❌ إلغاء", CALLBACK_RESET_NO),
+        ]
+    )
+    await update.effective_message.reply_text(
+        "⚠️ *تحذير: تصفير جميع البيانات*\n\n"
+        "سيتم حذف نهائي لكل:\n"
+        "• العملاء وأرصدتهم\n"
+        "• كل المعاملات والسجلات\n"
+        "• القيود المحاسبية وإعدادات التنبيه\n\n"
+        "لا يمكن التراجع عن هذه العملية. هل تريد المتابعة؟",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+    return ConversationHandler.END
+
+
+async def _reset_execute(update: Update) -> None:
+    """ينفّذ التصفير بعد التأكيد النهائي."""
+    query = update.callback_query
+    await _safe_answer(query)
+    try:
+        counts = db.reset_all_data()
+        await _safe_edit(
+            query,
+            "🗑️ *تم تصفير جميع البيانات بنجاح*\n\n"
+            f"• تم حذف: {counts['customers']} عميل\n"
+            f"• {counts['transactions']} معاملة\n"
+            f"• {counts['account_entries']} قيد محاسبي\n\n"
+            "النظام الآن فارغ وجاهز لبدء جديد. ✅",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("فشل تصفير البيانات")
+        await _safe_edit(query, f"خطأ في التصفير: {str(exc)}")
 
 
 def _is_cancel(text: str) -> bool:
@@ -795,14 +945,19 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     try:
         s = db.stats()
+        table = _mono_table(
+            ["البند", "القيمة"],
+            [
+                ["👥 العملاء", str(s["customers"])],
+                ["🔄 المعاملات", str(s["transactions"])],
+                ["💰 إجمالي الديون", _fmt_money(s["total_debts"])],
+                ["✅ إجمالي السداد", _fmt_money(s["total_paid"])],
+                ["⚖️ الصافي", _fmt_money(s["total_balance"])],
+            ],
+        )
         await update.effective_message.reply_text(
-            "📊 *إحصائيات عامة*\n\n"
-            f"👥 العملاء: *{s['customers']}*\n"
-            f"🔄 المعاملات: *{s['transactions']}*\n"
-            f"💰 إجمالي الديون: *{_fmt_money(s['total_debts'])}*\n"
-            f"✅ إجمالي السداد: *{_fmt_money(s['total_paid'])}*\n"
-            f"⚖️ الرصيد الصافي (ديون−سداد): *{_fmt_money(s['total_balance'])}*",
-            parse_mode=ParseMode.MARKDOWN,
+            f"📊 *إحصائيات عامة*\n\n{table}",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل عرض الإحصائيات")
@@ -909,8 +1064,8 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """طلب رفع ملف النسخة الاحتياطية للاستعادة."""
-    if not is_authorized(update):
+    """طلب رفع ملف النسخة الاحتياطية للاستعادة (للمالك فقط)."""
+    if not is_owner(update):
         await _guard(update)
         return ConversationHandler.END
     await update.effective_message.reply_text(
@@ -1141,10 +1296,17 @@ async def _weekly_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         inactive = db.list_inactive_customers(days=days, with_balance=True)
         if not inactive:
             return
-        lines = [f"🔕 *تنبيه: عملاء غير نشطين (+{days} يومًا)*", ""]
-        for c in inactive[:15]:
-            bal = to_decimal(c.get("balance") or 0)
-            lines.append(f"• {_md(c['name'])}: {_fmt_money(bal)} — {c.get('inactive_days', '?')} يوم")
+        rows = [
+            [str(c["name"]), _fmt_money(bal), f"{c.get('inactive_days', '?')} يوم"]
+            for c, bal in (
+                (c, to_decimal(c.get("balance") or 0)) for c in inactive[:15]
+            )
+        ]
+        lines = [
+            f"🔕 *تنبيه: عملاء غير نشطين \\(+{days} يومًا\\)*",
+            "",
+            _mono_table(["العميل", "الرصيد", "الخمول"], rows),
+        ]
         if len(inactive) > 15:
             lines.append(f"…و{len(inactive) - 15} آخرون")
         # التنبيه يصل للمالك وللمحاسب (إن كان مضبوطاً) معاً
@@ -1153,10 +1315,15 @@ async def _weekly_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(
                     recipient,
                     "\n".join(lines),
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.MARKDOWN_V2,
                 )
-            except Exception:  # noqa: BLE001
-                logger.warning("تعذّر إرسال التنبيه الأسبوعي إلى %s", recipient)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "فشل إرسال تنبيه العملاء غير النشطين إلى %s: %s",
+                    recipient,
+                    exc,
+                    exc_info=True,
+                )
     except Exception:  # noqa: BLE001
         logger.exception("فشل تنفيذ التنبيه الأسبوعي")
 
@@ -1235,13 +1402,17 @@ async def cmd_debts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 "🎉 لا يوجد أي ديون مستحقة — كل الحسابات مسددة!"
             )
             return ConversationHandler.END
-        lines = ["🔴 *صافي الديون المستحقة*", ""]
-        for i, c in enumerate(debtors, 1):
-            lines.append(f"{i}. {c['name']}: *{_fmt_money(c['balance'])}*")
-        lines.append("")
-        lines.append(f"💼 *إجمالي المستحق: {_fmt_money(total)}*")
+        table = _mono_table(
+            ["#", "العميل", "الرصيد"],
+            [
+                [str(i), str(c["name"]), _fmt_money(c["balance"])]
+                for i, c in enumerate(debtors, 1)
+            ],
+        )
         await update.effective_message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+            f"🔴 *صافي الديون المستحقة*\n\n{table}\n\n"
+            f"💼 *إجمالي المستحق: {_fmt_money_md2(total)}*",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل عرض الديون")
@@ -1259,16 +1430,20 @@ async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         s = db.stats()
         lines = ["🟢 *آخر عمليات السداد*", ""]
         if rows:
-            for r in rows:
-                amt = to_decimal(r.get("amount", 0))
-                ts = str(r.get("created_at", ""))[:10]
-                lines.append(f"• {r['customer_name']}: {_fmt_money(abs(amt))} ─ {ts}")
+            table = _mono_table(
+                ["العميل", "المبلغ", "التاريخ"],
+                [
+                    [str(r["customer_name"]), _fmt_money(abs(to_decimal(r.get("amount", 0)))), str(r.get("created_at", ""))[:10]]
+                    for r in rows
+                ],
+            )
+            lines.append(table)
         else:
             lines.append("لا توجد عمليات سداد بعد.")
         lines.append("")
-        lines.append(f"✅ *إجمالي ما سُدِّد: {_fmt_money(s['total_paid'])}*")
+        lines.append(f"✅ *إجمالي ما سُدِّد: {_fmt_money_md2(s['total_paid'])}*")
         await update.effective_message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل عرض المدفوعات")
@@ -1283,24 +1458,34 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     try:
         t = db.today_summary()
-        lines = [
-            "📅 *تقرير اليوم*",
-            "",
-            f"🔄 عدد العمليات: *{t['count']}*",
-            f"🔴 ديون اليوم: *{_fmt_money(t['debts'])}*",
-            f"🟢 سداد اليوم: *{_fmt_money(t['paid'])}*",
-            f"⚖️ صافي اليوم: *{_fmt_money(t['net'])}*",
-        ]
+        table = _mono_table(
+            ["البند", "القيمة"],
+            [
+                ["🔄 عدد العمليات", str(t["count"])],
+                ["🔴 ديون اليوم", _fmt_money(t["debts"])],
+                ["🟢 سداد اليوم", _fmt_money(t["paid"])],
+                ["⚖️ صافي اليوم", _fmt_money(t["net"])],
+            ],
+        )
+        lines = [f"📅 *تقرير اليوم*\n\n{table}"]
         if t["rows"]:
+            ops = _mono_table(
+                ["العميل", "النوع", "المبلغ", "الساعة"],
+                [
+                    [
+                        str(r["customer_name"]),
+                        "دين" if r.get("tx_type") == "debit" else "سداد",
+                        _fmt_money(abs(to_decimal(r.get("amount", 0)))),
+                        str(r.get("created_at", ""))[11:16],
+                    ]
+                    for r in t["rows"][:10]
+                ],
+            )
             lines.append("")
             lines.append("*آخر العمليات:*")
-            for r in t["rows"][:10]:
-                amt = to_decimal(r.get("amount", 0))
-                kind = "دين" if r.get("tx_type") == "debit" else "سداد"
-                ts = str(r.get("created_at", ""))[11:16]
-                lines.append(f"• {r['customer_name']} {kind} {_fmt_money(abs(amt))} ({ts})")
+            lines.append(ops)
         await update.effective_message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+            "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تقرير اليوم")
@@ -1319,14 +1504,18 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await update.effective_message.reply_text("🎉 لا يوجد مدينون.")
             return ConversationHandler.END
         top = debtors[:5]
-        lines = ["🏆 *أكبر المدينين*", ""]
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-        for i, c in enumerate(top):
-            lines.append(f"{medals[i]} {c['name']}: *{_fmt_money(c['balance'])}*")
-        lines.append("")
-        lines.append(f"💼 إجمالي الديون: *{_fmt_money(total)}*")
+        table = _mono_table(
+            ["#", "العميل", "الرصيد"],
+            [
+                [medals[i], str(c["name"]), _fmt_money(c["balance"])]
+                for i, c in enumerate(top)
+            ],
+        )
         await update.effective_message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+            f"🏆 *أكبر المدينين*\n\n{table}\n\n"
+            f"💼 إجمالي الديون: *{_fmt_money_md2(total)}*",
+            parse_mode=ParseMode.MARKDOWN_V2,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل عرض أكبر المدينين")
@@ -1490,6 +1679,8 @@ def build_application(settings: Settings) -> Application:
         .get_updates_write_timeout(25)
         .get_updates_pool_timeout(5)
         .post_init(post_init)
+        # ثبات الحالة في Supabase — متوافق مع Serverless (عقد متبدلة)
+        .persistence(SupabasePersistence(update_interval=60))
         .build()
     )
 
@@ -1532,6 +1723,8 @@ def build_application(settings: Settings) -> Application:
 async def post_init(application: Application) -> None:
     me = await application.bot.get_me()
     logger.info("البوت قيد التشغيل: @%s", me.username)
+    # قائمة الأوامر الرسمية حسب الصلاحيات
+    await _set_my_commands(application.bot)
     # الفحص الدوري لتنبيه العملاء غير النشطين (كل 15 دقيقة)
     if application.job_queue is not None:
         application.job_queue.run_repeating(_weekly_alert_job, interval=900, first=60)

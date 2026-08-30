@@ -20,17 +20,42 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets as _pysecrets
 
 from flask import Flask, Response, request
 
 from app.bot import build_application
 from app.config import settings
+from app.services import db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # يُبنى التطبيق مرة واحدة عند كل Cold Start، ويبقى مبدئياً للطلبات الدافئة
 _application = None
+_SECRET_SETTING_KEY = "webhook_secret_v1"
+
+
+def _webhook_secret() -> str | None:
+    """الرمز السري الإلزامي للـ Webhook.
+
+    الأولوية: متغير البيئة WEBHOOK_SECRET_TOKEN، وإلا يُولَّد رمز قوي تلقائياً
+    ويُخزَّن في Supabase (app_settings) ليبقى ثابتاً عبر كل العقد — فلا يمكن
+    لأي طلب خارج تليجرام الرسمي الوصول إلى البوت أبداً.
+    """
+    if settings.webhook_secret_token:
+        return settings.webhook_secret_token
+    try:
+        existing = db.get_setting(_SECRET_SETTING_KEY)
+        if existing:
+            return existing
+        generated = _pysecrets.token_urlsafe(32)
+        db.set_setting(_SECRET_SETTING_KEY, generated)
+        logger.info("تم توليد رمز سرّي للـ Webhook وتخزينه في قاعدة البيانات")
+        return generated
+    except Exception:  # noqa: BLE001
+        logger.exception("تعذّر توفير رمز سرّي للـ Webhook — تحقق من Supabase")
+        return None
 
 
 def get_application():
@@ -49,9 +74,9 @@ async def _ensure_ready() -> None:
 async def _set_webhook(url: str) -> dict:
     await _ensure_ready()
     await get_application().bot.set_webhook(
-        url=url, secret_token=settings.webhook_secret_token
+        url=url, secret_token=_webhook_secret()
     )
-    return {"ok": True, "url": url}
+    return {"ok": True, "url": url, "secret": "enabled"}
 
 
 async def _process_update(payload: dict) -> None:
@@ -60,7 +85,17 @@ async def _process_update(payload: dict) -> None:
     application = get_application()
     await _ensure_ready()
     update = Update.de_json(payload, application.bot)
-    await application.process_update(update)
+    try:
+        await application.process_update(update)
+    finally:
+        # حفظ حالة المحادثات (Persistence) بعد اكتمال المعالجة مباشرة —
+        # ضروري في Serverless: العقدة الحالية قد لا تعالج الطلب التالي.
+        persistence = application.persistence
+        if persistence is not None:
+            try:
+                persistence.flush()
+            except Exception:  # noqa: BLE001
+                logger.exception("فشل حفظ الحالة بعد معالجة التحديث")
 
 
 app = Flask(__name__)
@@ -93,16 +128,25 @@ def _setup_webhook() -> Response:
 
 
 def _handle_update() -> Response:
-    secret = settings.webhook_secret_token
+    """تحقق إلزامي من الرمز السري: أي طلب بلا رمز صحيح يُرفض بـ 401 فوراً."""
+    secret = _webhook_secret()
     if secret:
         header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if header != secret:
-            logger.warning("رمز سرّي غير صحيح للـ Webhook")
+            logger.warning(
+                "رفض تحديث برمز سرّي غير صحيح (IP: %s)",
+                request.headers.get("X-Forwarded-For", "unknown"),
+            )
             return Response(
                 json.dumps({"ok": False, "error": "invalid secret"}),
                 mimetype="application/json",
                 status=401,
             )
+    else:
+        # لا يمكن التحقق (فشل Supabase) — نرفض الاحتمال الأقل أماناً: نجيب 200
+        # بلا معالجة حتى لا يكرر تليجرام الإرسال، مع تسجيل تنبيه صارخ.
+        logger.error("الـ Webhook بلا رمز سرّي — تجاهل التحديث لأمان النظام")
+        return Response(json.dumps({"ok": True, "skipped": True}), mimetype="application/json", status=200)
 
     try:
         payload = request.get_json(force=True, silent=True)
