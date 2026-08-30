@@ -29,12 +29,12 @@ def test_search_key_strips_definite_article():
 
 # ── المبالغ ──────────────────────────────────────────────────
 def test_parse_number_arabic_indic():
-    assert parse_number("٥٠") == 50.0
+    assert parse_number("٥٠") == Decimal("50")
 
 
 def test_parse_amount_words_parts():
-    assert parse_amount_words("خمسين") == 50.0
-    assert parse_amount_words("مية") == 100.0
+    assert parse_amount_words("خمسين") == Decimal("50")
+    assert parse_amount_words("مية") == Decimal("100")
 
 
 # ── المال DECIMAL(15,2) ─────────────────────────────────────
@@ -55,22 +55,22 @@ def test_to_decimal_handles_negative():
 def test_debit_line():
     res = parse_message("دين محمد 50")
     assert res.action == "debit"
-    assert res.amount == 50.0
+    assert res.amount == Decimal("50")
     assert "محمد" in (res.customer or "")
 
 
 def test_credit_line():
     res = parse_message("دفع علي 100")
     assert res.action == "credit"
-    assert res.amount == 100.0
+    assert res.amount == Decimal("100")
     assert "علي" in (res.customer or "")
 
 
 def test_debit_with_word_hundred_colloquial():
     res = parse_message("على أحمد ميتين")
     assert res.action == "debit"
-    assert res.amount == 200.0
-    assert "أحمد" in (res.customer or "")
+    assert res.amount == Decimal("200")
+    assert "احمد" in (res.customer or "")
 
 
 def test_balance_query():
@@ -104,3 +104,34 @@ def test_balance_with_balance_word_and_name():
 def test_unknown_line_no_action():
     res = parse_message("مرحبا كيف حالك")
     assert res.action is None
+
+
+def test_parser_normalizes_and_keeps_customer_named_ali():
+    res = parse_message("دِين عَلِي ١٢٫٥٠")
+    assert res.action == "debit"
+    assert res.customer == "علي"
+    assert res.amount == Decimal("12.50")
+
+
+# ── المحاسبي الشخصي (دخل / مصروف) ─────────────────────────────
+def test_income_line():
+    res = parse_message("دخل المحل 500")
+    assert res.action == "income"
+    assert res.entry_type == "income"
+    assert res.amount == Decimal("500")
+    assert "المحل" in (res.note or "")
+
+
+def test_expense_line():
+    res = parse_message("مصروف كهرباء 120")
+    assert res.action == "expense"
+    assert res.entry_type == "expense"
+    assert res.amount == Decimal("120")
+    assert "كهرباء" in (res.note or "")
+
+
+def test_income_does_not_steal_customer_credit():
+    # "دفع" تبقى سداداً لعملاء الديون لا مصروفاً شخصياً
+    res = parse_message("دفع علي 100")
+    assert res.action == "credit"
+    assert res.customer == "علي"

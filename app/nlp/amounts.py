@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
 
 _INDIC_TO_LATIN = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _LATIN_NUM_RE = re.compile(r"^\d+(?:[.,]\d+)?$")
@@ -41,22 +42,22 @@ _MULTIPLIER_SINGLE = {
 }
 
 
-def parse_number(raw: str) -> float | None:
-    """تحويل نص رقمي (لاتيني أو عربي-هندي) إلى float، أو None إن لم يكن رقماً."""
-    s = (raw or "").strip().replace(",", ".")
+def parse_number(raw: str) -> Decimal | None:
+    """تحويل نص رقمي (لاتيني أو عربي-هندي) إلى Decimal، أو None."""
+    s = (raw or "").strip().replace(",", ".").replace("٫", ".")
     s = s.translate(_INDIC_TO_LATIN)
     if not s:
         return None
     try:
-        val = float(s)
-    except ValueError:
+        val = Decimal(s)
+    except InvalidOperation:
         return None
-    if val <= 0:
+    if not val.is_finite() or val <= 0:
         return None
     return val
 
 
-def parse_amount_words(phrase: str) -> float | None:
+def parse_amount_words(phrase: str) -> Decimal | None:
     """تفسير عبارة بالكلمات (مثال 'خمسين' → 50). يفشل بأمان على غير المبالغ."""
     if not phrase:
         return None
@@ -66,7 +67,7 @@ def parse_amount_words(phrase: str) -> float | None:
         return numeric
 
     tokens = [t for t in _WORD_SPLIT.split(phrase) if t]
-    total = 0.0
+    total = Decimal("0")
     for token in tokens:
         val = _AMOUNT_WORDS.get(token)
         if val is None:

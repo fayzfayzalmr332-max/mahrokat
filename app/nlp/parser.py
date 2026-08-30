@@ -18,17 +18,22 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from app.nlp.amounts import parse_number, parse_amount_words
+from app.nlp.normalization import normalize_arabic
 
 # ── مفردات الأفعال (قابلة للتوسيع) ───────────────────────────
-DEBIT_VERBS = ("دين", "على", "حمل", "تحمل", "مدين")
+DEBIT_VERBS = ("دين", "علي", "حمل", "تحمل", "مدين")
 CREDIT_VERBS = ("دفع", "واصل", "سدد", "تسليم")
 BALANCE_VERBS = ("حساب", "صافي", "رصيد", "باقي", "كم")
+# أفعال المحاسبي الشخصي (صندوق المالك) — كلمات مميزة لا تتصادم مع ديون العملاء
+INCOME_VERBS = ("دخل", "ايراد", "ارباح", "قبض")
+EXPENSE_VERBS = ("مصروف", "صرف", "انفاق")
 # كلمات إغلاق تُقصّ ما بعدها (جملة دعائية) — تُهمل في التحليل
 CLOSE_WORDS = ("اخر", "يرحل", "شكرا", "ويبارك")
 
-_NUMBER_TOKEN_RE = re.compile(r"\d+(?:[.,]\d+)?")
+_NUMBER_TOKEN_RE = re.compile(r"\d+(?:[.,٫]\d+)?")
 _TOKEN_SEP = re.compile(r"[\s،,;-]+")
 
 
@@ -36,12 +41,15 @@ _TOKEN_SEP = re.compile(r"[\s،,;-]+")
 class ParseResult:
     """نتيجة التحليل الكامل للرسالة."""
 
-    action: str | None = None  # 'debit' | 'credit' | 'balance'
+    action: str | None = None  # 'debit' | 'credit' | 'balance' | 'income' | 'expense'
     customer: str | None = None
-    amount: float | None = None  # القيمة تُحوّل لاحقاً إلى Decimal(15,2)
+    amount: Decimal | None = None
     raw: str = ""
     uncertain: bool = False
     clean_tokens: list[str] = field(default_factory=list)
+    # ── حقول اختيارية للمحاسبي الشخصي ──
+    entry_type: str | None = None  # 'income' | 'expense'
+    note: str | None = None  # وصف القيد المحاسبي (نص الباقي بعد المبلغ)
 
 
 def _split_words(text: str) -> list[str]:
@@ -55,7 +63,7 @@ def _split_words(text: str) -> list[str]:
 
 
 def _is_number(w: str) -> bool:
-    return bool(_NUMBER_TOKEN_RE.fullmatch(w.replace(",", ".")))
+    return bool(_NUMBER_TOKEN_RE.fullmatch(w.replace(",", ".").replace("٫", ".")))
 
 
 def parse_message(text: str) -> ParseResult:
@@ -64,13 +72,44 @@ def parse_message(text: str) -> ParseResult:
     الاستراتيجية: البحث عن أفعال (دين/دفع) وأرقام،
     ثم باقي الكلمات تُعدّ اسماً للعميل. لا يفرض ترتيباً صارماً.
     """
-    raw = (text or "").strip()
+    raw = normalize_arabic(text)
     res = ParseResult(raw=raw)
     if not raw:
         return res
 
     words = _split_words(raw)
     if not words:
+        return res
+
+    # ── المحاسبي الشخصي: دخل / مصروف ──────────────────────────
+    n_income = sum(1 for w in words if w in INCOME_VERBS)
+    n_expense = sum(1 for w in words if w in EXPENSE_VERBS)
+    if n_income > 0 or n_expense > 0:
+        is_income = n_income >= n_expense
+        verb_words = INCOME_VERBS if is_income else EXPENSE_VERBS
+        verb = next((w for w in words if w in verb_words), None)
+        vidx = words.index(verb) if verb else 0
+
+        amount: Decimal | None = None
+        rest_tokens: list[str] = []
+        for i, w in enumerate(words):
+            if i == vidx:
+                continue
+            if _is_number(w) and amount is None:
+                amount = parse_number(w)
+                continue
+            val = parse_amount_words(w)
+            if val is not None and amount is None:
+                amount = val
+                continue
+            rest_tokens.append(w)
+
+        res.action = "income" if is_income else "expense"
+        res.entry_type = "income" if is_income else "expense"
+        res.amount = amount
+        res.note = " ".join(rest_tokens).strip() or None
+        res.uncertain = amount is None
+        res.clean_tokens = words
         return res
 
     # ── أوامر الرصيد (بدون مبلغ) ──────────────────────────────
@@ -93,7 +132,7 @@ def parse_message(text: str) -> ParseResult:
     is_debit = n_debit > n_credit
 
     # ── استخراج المبلغ ────────────────────────────────────────
-    amount: float | None = None
+    amount: Decimal | None = None
     # الرقم الذي يتبع الفعل مباشرة (الأكثر دلالة)
     verb_words = DEBIT_VERBS if is_debit else CREDIT_VERBS
     verb = next((w for w in words if w in verb_words), None)
@@ -123,8 +162,8 @@ def parse_message(text: str) -> ParseResult:
 
     # ── استخراج الاسم: كل الكلمات غير الفعل وغير المبلغ وغير الرقم ──
     name_tokens_final: list[str] = []
-    for t in words:
-        if t in verb_words or _is_number(t):
+    for index, t in enumerate(words):
+        if index == vidx or _is_number(t):
             continue
         if parse_amount_words(t) is not None:
             continue
