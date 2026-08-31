@@ -86,6 +86,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("account", "🧮 الصندوق المحاسبي"),
     BotCommand("alerts", "🔕 التنبيهات"),
     BotCommand("history", "🧾 سجل عميل"),
+    BotCommand("card", "🪪 بطاقة عميل"),
     BotCommand("search", "🔍 بحث بالاسم"),
     BotCommand("undo", "↩️ تراجع عن عملية"),
     BotCommand("export", "📄 تصدير CSV"),
@@ -142,7 +143,47 @@ def is_owner(update: Update) -> bool:
 def _fmt_money(value) -> str:
     d = to_decimal(value)
     cur = (env_settings.currency or "").strip()
-    return f"{d:,.2f} {cur}".strip() if cur else f"{d:,.2f}"
+    s = f"{d:,.2f} {cur}".strip() if cur else f"{d:,.2f}"
+    return _hi_num(s)
+
+
+# ── أرقام هندية (٠-٩) وتواريخ عربية احترافية ─────────────────
+_ARABIC_INDIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+
+def _hi_num(text: object) -> str:
+    """تحويل الأرقام الغربية إلى أرقام هندية (٠١٢٣٤٥٦٧٨٩) — تستخدم في
+    المبالغ والتواريخ والعدادات داخل الرسائل لعرض عربي أنيق ومحترف."""
+    return str(text or "").translate(_ARABIC_INDIC)
+
+
+_AR_MONTHS = [
+    "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+    "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
+]
+_AR_WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
+
+
+def _fmt_dt(iso: object, with_time: bool = True) -> str:
+    """تنسيق ISO (UTC) إلى تاريخ عربي مقروء حسب توقيت المحطة + أرقام هندية.
+
+    مثال: «الخميس ٢٠ أكتوبر ٢٠٢٦ · ١٢:٣٤ م»
+    """
+    if not iso:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        local = dt.astimezone(timezone(timedelta(hours=env_settings.timezone_offset)))
+    except Exception:  # noqa: BLE001
+        return _hi_num(str(iso)[:16])
+    day = _AR_WEEKDAYS[local.weekday()]
+    date = f"{_hi_num(local.day)} {_AR_MONTHS[local.month - 1]} {_hi_num(local.year)}"
+    if not with_time:
+        return f"{day} {date}"
+    h12 = local.hour % 12 or 12
+    ampm = "ص" if local.hour < 12 else "م"
+    time_s = f"{_hi_num(h12)}:{_hi_num(f'{local.minute:02d}')} {ampm}"
+    return f"{day} {date} · {time_s}"
 
 
 def _md(text: object) -> str:
@@ -708,8 +749,7 @@ async def _show_balance(update: Update, name: str) -> None:
             for r in activity:
                 amt = abs(to_decimal(r.get("amount", 0)))
                 arrow = "+" if r.get("tx_type") == "debit" else "−"
-                stamp = str(r.get("created_at", ""))[:16]
-                lines.append(f"{arrow}{_fmt_money(amt)} · {stamp}")
+                lines.append(f"{arrow}{_fmt_money(amt)} · {_fmt_dt(r.get('created_at'))}")
         await update.effective_message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.MARKDOWN
         )
@@ -934,8 +974,7 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             for r in act:
                 amt = to_decimal(r.get("amount", 0))
                 kind = "دين" if r.get("tx_type") == "debit" else "سداد"
-                ts = str(r.get("created_at", ""))[:10]
-                msg.append(f"• {kind} {_fmt_money(abs(amt))} ─ {ts}")
+                msg.append(f"• {kind} {_fmt_money(abs(amt))} — {_fmt_dt(r.get('created_at'), with_time=False)}")
         await _safe_reply(query.message, "\n".join(msg), parse_mode=ParseMode.MARKDOWN)
         return
 
@@ -954,6 +993,7 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "report": cmd_report,
             "list": cmd_list,
             "stats": cmd_stats,
+            "card": cmd_card,
             "account": cmd_account,
             "alerts": cmd_alerts,
             "backup": cmd_backup,
@@ -1045,7 +1085,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             [
                 ["ديون", _fmt_money(this_m["debts"]), _fmt_money(prev_m["debts"])],
                 ["سداد", _fmt_money(this_m["paid"]), _fmt_money(prev_m["paid"])],
-                ["عمليات", str(this_m["count"]), str(prev_m["count"])],
+                ["عمليات", _hi_num(this_m["count"]), _hi_num(prev_m["count"])],
             ],
         )
         rate = r["payment_rate"]
@@ -1082,13 +1122,13 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         table = _mono_table(
             ["العميل", "الرصيد", "آخر حركة"],
             [
-                [_md(c["name"]), _fmt_money(c["balance"]), f"{c['days']} يوم" if c["days"] >= 0 else "؟"]
+                [_md(c["name"]), _fmt_money(c["balance"]), f"{_hi_num(c['days'])} يوم" if c["days"] >= 0 else "؟"]
                 for c in r["rows"][:15]
             ],
         )
         buckets = r["buckets"]
         summary = " · ".join(
-            f"{label}: {len(names)}" for label, names in buckets.items() if names
+            f"{label}: {_hi_num(len(names))}" for label, names in buckets.items() if names
         )
         await update.effective_message.reply_text(
             f"⏳ *أعمار الديون* \\(الأقدم أولاً\\)\n\n{table}\n\n"
@@ -1138,20 +1178,20 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         except Exception:  # noqa: BLE001
             debtors_count = None
         rate = (
-            f"{(s['total_paid'] / s['total_debts'] * 100):.1f}%"
+            f"{_hi_num(f'{(s['total_paid'] / s['total_debts'] * 100):.1f}')}%"
             if s["total_debts"] > 0
             else "─"
         )
         rows = [
-            ["👥 العملاء", str(s["customers"])],
-            ["🔄 المعاملات", str(s["transactions"])],
+            ["👥 العملاء", _hi_num(s["customers"])],
+            ["🔄 المعاملات", _hi_num(s["transactions"])],
             ["💰 إجمالي الديون", _fmt_money(s["total_debts"])],
             ["✅ إجمالي السداد", _fmt_money(s["total_paid"])],
             ["⚖️ الصافي", _fmt_money(s["total_balance"])],
             ["🎯 معدل السداد", rate],
         ]
         if debtors_count is not None:
-            rows.append(["🔴 مدينون نشطون", str(debtors_count)])
+            rows.append(["🔴 مدينون نشطون", _hi_num(debtors_count)])
         table = _mono_table(["البند", "القيمة"], rows)
         await update.effective_message.reply_text(
             f"📊 *إحصائيات عامة*\n\n{table}",
@@ -1160,6 +1200,59 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل عرض الإحصائيات")
         await update.effective_message.reply_text(f"خطأ في الإحصائيات: {str(exc)}")
+    return ConversationHandler.END
+
+
+async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """بطاقة عميل كاملة: الرصيد، العمر الدفترى، آخر نشاط، آخر 5 حركات."""
+    if not is_authorized(update):
+        await _guard(update)
+        return ConversationHandler.END
+    args = (context.args or [])
+    if not args:
+        await update.effective_message.reply_text(
+            "استخدام:  /card <اسم العميل>\nمثال:  /card محمد"
+        )
+        return ConversationHandler.END
+    name = " ".join(args).strip()
+    try:
+        found = db.find_customer(name)
+        if not found:
+            await update.effective_message.reply_text(
+                f"لم أجد عميلاً باسم «{name}» في السجلات."
+            )
+            return ConversationHandler.END
+        info = db.customer_stats(found["id"])
+        c = info["customer"]
+        bal = info["balance"]
+        last = info.get("last_activity_at")
+        count = info["txn_count"]
+        table = _mono_table(
+            ["البند", "القيمة"],
+            [
+                ["💳 الرصيد", _fmt_money(bal)],
+                ["🔄 عدد الحركات", _hi_num(count)],
+                ["🕒 آخر نشاط", _fmt_dt(last) if last else "—"],
+            ],
+        )
+        msg_lines = [f"🪪 *بطاقة العميل* — {_md(c['name'])}", table, ""]
+        if info["recent"]:
+            msg_lines.append("*آخر 5 حركات:*")
+            for r in info["recent"]:
+                amt = to_decimal(r.get("amount", 0))
+                kind = "دين" if r.get("tx_type") == "debit" else "سداد"
+                note = f" · {r.get('note')}" if r.get("note") else ""
+                msg_lines.append(
+                    f"• {kind} {_fmt_money(abs(amt))}{note} — {_fmt_dt(r.get('created_at'))}"
+                )
+        await update.effective_message.reply_text(
+            "\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN_V2
+        )
+    except ValueError:
+        await update.effective_message.reply_text(f"لا يوجد عميل باسم «{name}».")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("فشل عرض بطاقة العميل")
+        await update.effective_message.reply_text(f"خطأ: {str(exc)}")
     return ConversationHandler.END
 
 
@@ -1196,8 +1289,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
             amt = to_decimal(r.get("amount", 0))
             kind = "دين" if r.get("tx_type") == "debit" else "سداد"
             note = f" · {r.get('note')}" if r.get("note") else ""
-            ts = str(r.get("created_at", ""))[:16]
-            lines.append(f"• {kind} {_fmt_money(abs(amt))}{note} ─ {ts}")
+            lines.append(f"• {kind} {_fmt_money(abs(amt))}{note} ─ {_fmt_dt(r.get('created_at'))}")
         lines.append("")
         lines.append(f"⚖️ الرصيد الحالي: *{_fmt_money(bal)}*")
         await update.effective_message.reply_text(
@@ -1352,13 +1444,14 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ],
         [
             InlineKeyboardButton("🗂️ قائمة العملاء", callback_data=f"{CALLBACK_MENU_PREFIX}list"),
+            InlineKeyboardButton("🪪 بطاقة عميل", callback_data=f"{CALLBACK_MENU_PREFIX}card"),
+        ],
+        [
             InlineKeyboardButton("📊 إحصائيات", callback_data=f"{CALLBACK_MENU_PREFIX}stats"),
+            InlineKeyboardButton("🧮 الصندوق المحاسبي", callback_data=f"{CALLBACK_MENU_PREFIX}account"),
         ],
         [
-            InlineKeyboardButton("🧮 المحاسبي", callback_data=f"{CALLBACK_MENU_PREFIX}account"),
             InlineKeyboardButton("🔕 التنبيهات", callback_data=f"{CALLBACK_MENU_PREFIX}alerts"),
-        ],
-        [
             InlineKeyboardButton("💾 نسخ احتياطي", callback_data=f"{CALLBACK_MENU_PREFIX}backup"),
             InlineKeyboardButton("📄 تصدير CSV", callback_data=f"{CALLBACK_MENU_PREFIX}export"),
         ],
@@ -1607,7 +1700,7 @@ async def cmd_debts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         table = _mono_table(
             ["#", "العميل", "الرصيد"],
             [
-                [str(i), str(c["name"]), _fmt_money(c["balance"])]
+                [_hi_num(i), str(c["name"]), _fmt_money(c["balance"])]
                 for i, c in enumerate(debtors, 1)
             ],
         )
@@ -1635,7 +1728,7 @@ async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             table = _mono_table(
                 ["العميل", "المبلغ", "التاريخ"],
                 [
-                    [str(r["customer_name"]), _fmt_money(abs(to_decimal(r.get("amount", 0)))), str(r.get("created_at", ""))[:10]]
+                    [str(r["customer_name"]), _fmt_money(abs(to_decimal(r.get("amount", 0)))), _fmt_dt(r.get("created_at"), with_time=False)]
                     for r in rows
                 ],
             )
@@ -1660,16 +1753,17 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     try:
         t = db.today_summary()
+        today_ar = _fmt_dt(_local_now().isoformat(), with_time=False)
         table = _mono_table(
             ["البند", "القيمة"],
             [
-                ["🔄 عدد العمليات", str(t["count"])],
+                ["🔄 عدد العمليات", _hi_num(t["count"])],
                 ["🔴 ديون اليوم", _fmt_money(t["debts"])],
                 ["🟢 سداد اليوم", _fmt_money(t["paid"])],
                 ["⚖️ صافي اليوم", _fmt_money(t["net"])],
             ],
         )
-        lines = [f"📅 *تقرير اليوم*\n\n{table}"]
+        lines = [f"📅 *تقرير اليوم* — {_md2(today_ar)}\n\n{table}"]
         if t["rows"]:
             ops = _mono_table(
                 ["العميل", "النوع", "المبلغ", "الساعة"],
@@ -1678,7 +1772,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                         str(r["customer_name"]),
                         "دين" if r.get("tx_type") == "debit" else "سداد",
                         _fmt_money(abs(to_decimal(r.get("amount", 0)))),
-                        str(r.get("created_at", ""))[11:16],
+                        _hi_num(str(r.get("created_at", ""))[11:16]),
                     ]
                     for r in t["rows"][:10]
                 ],
@@ -1898,6 +1992,7 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("aging", cmd_aging))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("card", cmd_card))
     # التصفير (للمالك فقط — تأكيد مزدوج بمستويين عبر الأزرار)
     app.add_handler(CommandHandler("reset", cmd_reset))
     # الميزات التحليلية

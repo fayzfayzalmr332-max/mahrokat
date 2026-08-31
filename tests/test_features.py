@@ -379,3 +379,131 @@ def test_weekly_alert_is_markdownv2_safe(monkeypatch):
     for text, kw in sent.values():
         assert _md2_validate(text), f"التنبيه أرسل MarkdownV2 مكسوراً:\n{text!r}"
         assert "+30" in text and "\\+30" in text  # القوسان والعلامة مهروبتان
+
+
+# ── الأرقام الهندية والتواريخ العربية ─────────────────────────
+def test_hi_num_converts_digits():
+    """المبالغ والعدادات يجب أن تُعرض بأرقام هندية (٠-٩)."""
+    import app.bot as botmod  # noqa: PLC0415
+
+    assert botmod._hi_num("1234567890") == "١٢٣٤٥٦٧٨٩٠"
+    assert botmod._hi_num("0") == "٠"
+    assert botmod._hi_num(None) == ""
+    assert botmod._hi_num("") == ""
+    # لا يغيّر الحروف
+    assert "م" in botmod._hi_num("م 123 م")
+
+
+def test_fmt_money_uses_indian_digits():
+    from decimal import Decimal  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+
+    with_monkeypatch_currency = ""
+
+    old_currency = None
+    import app.config as cmod  # noqa: PLC0415
+
+    s = botmod.env_settings
+    old_curr = getattr(s, "currency", "")
+    object.__setattr__(s, "currency", "")
+    try:
+        out = botmod._fmt_money(Decimal("1234.50"))
+        assert "١" in out and "٢" in out and "٤" in out  # أرقام هندية
+        assert any(c in "٠١٢٣٤٥٦٧٨٩" for c in out)
+    finally:
+        object.__setattr__(s, "currency", old_curr)
+
+
+def test_fmt_dt_arabic_format():
+    import app.bot as botmod  # noqa: PLC0415
+
+    # ISO واحد معروف → اليوم يُستنتج حسب timezone_offset (افتراضياً +3)
+    out = botmod._fmt_dt("2026-08-20T10:30:00+00:00")
+    assert "أغسطس" in out       # الشهر عربي
+    assert "الخميس" in out      # اليوم عربي
+    assert "٠" in out or "١" in out  # أرقام هندية
+    assert "م" in out or "ص" in out  # صباحاً/مساءً
+
+
+def test_fmt_dt_no_time():
+    import app.bot as botmod  # noqa: PLC0415
+
+    out = botmod._fmt_dt("2026-08-20T10:30:00+00:00", with_time=False)
+    assert out == "الخميس ٢٠ أغسطس ٢٠٢٦"  # تاريخ فقط، بلا وقت، بأرقام هندية
+
+
+def test_fmt_dt_empty_returns_dash():
+    import app.bot as botmod  # noqa: PLC0415
+
+    assert botmod._fmt_dt(None) == "—"
+    assert botmod._fmt_dt("") == "—"
+
+
+# ── بطاقة العميل /card ────────────────────────────────────────
+def test_card_command_registered_and_menu_mapped():
+    import app.bot as botmod  # noqa: PLC0415
+    from app.bot import build_application  # noqa: PLC0415
+
+    app = build_application(settings)
+    cmds = set()
+    for hs in app.handlers.values():
+        for h in hs:
+            entry = getattr(h, "commands", None) or getattr(h, "command", None)
+            if entry:
+                cmds.update(c if isinstance(c, str) else c[0] for c in entry)
+    assert "card" in cmds
+    # في قائمة الأوامر الرسمية
+    cmds_bot = {c.command for c in botmod._commands_for(True)}
+    assert "card" in cmds_bot
+
+
+def test_card_command_output(monkeypatch):
+    """ينفّذ /card فعلياً ويعرض بطاقة بأرقام هندية وتواريخ عربية."""
+    import asyncio  # noqa: PLC0415
+    from decimal import Decimal as D  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    class _Msg:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append((text, kw))
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        effective_user = _Usr()
+        effective_message = _Msg()
+        callback_query = None
+
+    monkeypatch.setattr(sdb, "find_customer", lambda name: {"id": "c1", "name": "زاهر"})
+    monkeypatch.setattr(
+        sdb,
+        "customer_stats",
+        lambda cid: {
+            "customer": {"id": "c1", "name": "زاهر"},
+            "balance": D("905"),
+            "count": 3,
+            "txn_count": 3,
+            "last_activity_at": "2026-08-20T10:30:00+00:00",
+            "recent": [
+                {"amount": "500", "tx_type": "debit", "note": None,
+                 "created_at": "2026-08-20T10:30:00+00:00"},
+            ],
+        },
+    )
+
+    upd = _Upd()
+    ctx = SimpleNamespace(args=["زاهر"])
+    asyncio.run(botmod.cmd_card(upd, ctx))
+    assert upd.effective_message.sent
+    text = upd.effective_message.sent[0][0]
+    assert "زاهر" in text
+    assert "أغسطس" in text       # تاريخ عربي
+    assert "٠" in text or "١" in text  # أرقام هندية
