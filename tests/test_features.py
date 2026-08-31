@@ -229,3 +229,153 @@ def test_reset_guard_blocks_non_owner(monkeypatch):
     upd2 = _Upd()
     upd2.effective_user.id = settings.owner_telegram_id
     assert asyncio.run(botmod._reset_guard_query(upd2)) is False
+
+
+# ── أمان MarkdownV2: لا حروف محجوزة غير مهروبة في رسائل التقارير ───
+_MD2_RESERVED = set("[]()~>#+-=|{}.!")
+
+
+def _md2_validate(text):
+    """يمنع رسائل مكسورة: أي حرف محجوز غير مهروب خارج كتلة كود = خطأ (مثل
+    «Can't parse entities: ...»). يتجاهل `*` و `_` (تُستخدم أزواجاً للخط العريض)."""
+    i, n = 0, len(text)
+    in_code = False
+    while i < n:
+        ch = text[i]
+        if ch == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            if j - i >= 3:
+                in_code = not in_code
+                i = j
+                continue
+        if not in_code and ch in _MD2_RESERVED:
+            k = i - 1
+            bs = 0
+            while k >= 0 and text[k] == "\\":
+                bs += 1
+                k -= 1
+            if bs % 2 == 0:
+                return False
+        i += 1
+    return True
+
+
+def _capture_update():
+    class _Msg:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append((text, kw))
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        def __init__(self):
+            self.effective_user = _Usr()
+            self.effective_message = _Msg()
+            self.callback_query = None
+
+    return _Upd()
+
+
+def test_markdownv2_messages_are_escaped(monkeypatch):
+    """تنفيذ كل أوامر التقارير MarkdownV2 فعلياً والتحقق من سلامة الهروب —
+    يمنع انحدار خطأ Telegram الشهير «Can't parse entities»."""
+    import asyncio  # noqa: PLC0415
+    from decimal import Decimal as D  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    # بيانات وهمية موزعة على كل التقرير
+    state = {
+        "monthly": {
+            "this": {"debts": D("600"), "paid": D("200"), "count": 3, "net": D("800")},
+            "prev": {"debts": D("300"), "paid": D("0"), "count": 1, "net": D("300")},
+            "payment_rate": 33.3,
+        },
+        "aging": {
+            "rows": [
+                {"name": "زاهر بالبطه", "balance": D("905"), "days": 120, "bucket": "متقادم"},
+                {"name": "عبدو (الجنوب)", "balance": D("100"), "days": 3, "bucket": "أسبوع"},
+            ],
+            "buckets": {"متقادم": ["زاهر بالبطه"], "أسبوع": ["عبدو (الجنوب)"]},
+            "total": D("1005"),
+        },
+        "stats": {"customers": 4, "transactions": 28, "total_debts": D("27982913"),
+                  "total_paid": D("27981908"), "total_balance": D("1005")},
+        "debtors": ([{"id": "x", "name": "زاهر", "balance": D("905")}], D("1005")),
+        "today": {"count": 2, "debts": D("500"), "paid": D("200"), "net": D("700"),
+                  "rows": [{"customer_name": "زاهر", "tx_type": "debit", "amount": D("500"),
+                            "created_at": "2026-08-30T10:00:00"}]},
+    }
+
+    monkeypatch.setattr(sdb, "monthly_report", lambda: state["monthly"])
+    monkeypatch.setattr(sdb, "aging_report", lambda: state["aging"])
+    monkeypatch.setattr(sdb, "stats", lambda: state["stats"])
+    monkeypatch.setattr(sdb, "list_debtors", lambda: state["debtors"])
+    monkeypatch.setattr(sdb, "today_summary", lambda: state["today"])
+
+    handlers = [
+        botmod.cmd_report,
+        botmod.cmd_aging,
+        botmod.cmd_stats,
+        botmod.cmd_debts,
+        botmod.cmd_today,
+        botmod.cmd_top,
+    ]
+    for i, fn in enumerate(handlers):
+        upd = _capture_update()
+        ctx = SimpleNamespace(args=[])
+        asyncio.run(fn(upd, ctx))
+        assert upd.effective_message.sent, f"{fn.__name__} لم يرسل رسالة"
+        for text, kw in upd.effective_message.sent:
+            pm = kw.get("parse_mode")
+            if pm is not None and "MARKDOWN" in str(pm):
+                assert _md2_validate(text), (
+                    f"{fn.__name__} أرسل MarkdownV2 مكسوراً:\n{text!r}"
+                )
+
+
+def test_weekly_alert_is_markdownv2_safe(monkeypatch):
+    """رسالة تنبيه غير النشطين صالحة MarkdownV2 (كانت تُرسل بخلافه أخطاءَ)."""
+    import asyncio  # noqa: PLC0415
+    from decimal import Decimal as D  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    sent = {}
+
+    class _Bot:
+        async def send_message(self, chat_id, text, **kw):
+            sent[chat_id] = (text, kw)
+
+    async def fake_job(context):
+        await botmod._weekly_alert_job(context)
+
+    monkeypatch.setattr(sdb, "get_setting", lambda k: "1" if k == "weekly_alert_enabled" else {
+        "weekly_alert_weekday": str(botmod._local_now().weekday()),
+        "inactive_days": "30",
+        "weekly_alert_time": "00:00",
+    }.get(k, "1"))
+    monkeypatch.setattr(
+        sdb, "list_inactive_customers",
+        lambda **kw: [{"name": "زاهر", "balance": D("905"), "inactive_days": 45}],
+    )
+
+    ctx = SimpleNamespace(
+        bot=_Bot(),
+        bot_data={},
+    )
+    asyncio.run(fake_job(ctx))
+    assert sent, "لم تُرسل رسالة تنبيه"
+    for text, kw in sent.values():
+        assert _md2_validate(text), f"التنبيه أرسل MarkdownV2 مكسوراً:\n{text!r}"
+        assert "+30" in text and "\\+30" in text  # القوسان والعلامة مهروبتان

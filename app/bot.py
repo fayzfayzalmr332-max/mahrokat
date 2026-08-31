@@ -1050,7 +1050,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         rate = r["payment_rate"]
         rate_line = (
-            f"🎯 معدل سداد هذا الشهر: *{rate}%*" if rate is not None else "🎯 لا ديون هذا الشهر بعد"
+            # معدل السداد قد يحوي "." (مثل 33.3) — محجوزة في MarkdownV2 ويجب هروبها
+            f"🎯 معدل سداد هذا الشهر: *{_md2(str(rate))}%*"
+            if rate is not None
+            else "🎯 لا ديون هذا الشهر بعد"
         )
         d_debt = _md2(delta(this_m["debts"], prev_m["debts"]))
         d_paid = _md2(delta(this_m["paid"], prev_m["paid"]))
@@ -1088,10 +1091,10 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"{label}: {len(names)}" for label, names in buckets.items() if names
         )
         await update.effective_message.reply_text(
-            f"⏳ *أعمار الديون* (الأقدم أولاً)\n\n{table}\n\n"
+            f"⏳ *أعمار الديون* \\(الأقدم أولاً\\)\n\n{table}\n\n"
             f"🗂️ الشرائح: {summary}\n"
             f"💼 إجمالي: *{_fmt_money_md2(r['total'])}*\n\n"
-            "💡 ابدأ التحصيل بأصحاب الديون المتقادمة.",
+            r"💡 ابدأ التحصيل بأصحاب الديون المتقادمة\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
     except Exception as exc:  # noqa: BLE001
@@ -1502,7 +1505,7 @@ async def _weekly_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         ]
         lines = [
-            f"🔕 *تنبيه: عملاء غير نشطين \\(+{days} يومًا\\)*",
+            fr"🔕 *تنبيه: عملاء غير نشطين \(\+{days} يومًا\)*"
             "",
             _mono_table(["العميل", "الرصيد", "الخمول"], rows),
         ]
