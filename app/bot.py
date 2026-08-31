@@ -22,6 +22,8 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ParseMode
@@ -101,6 +103,42 @@ def inline_kb(buttons: list[tuple[str, str]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(text, callback_data=data)] for text, data in buttons]
     )
+
+
+# ── لوحة الردود الدائمة (أيقونة المربعات في مربع الكتابة) ──────
+# is_persistent=True تجعل الأزرار مطوية كأيقونة مضغوطة بجانب حقل الإدخال —
+# يضغط المستخدم عليها لتوسيعها أو إخفاؤها، تماماً كميزة «المربعات الأربعة».
+REPLY_MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📅 تقرير اليوم"), KeyboardButton("🔴 الديون")],
+        [KeyboardButton("🟢 السداد"), KeyboardButton("🏆 الأكبر")],
+        [KeyboardButton("🗂️ العملاء"), KeyboardButton("📊 إحصائيات")],
+        [KeyboardButton("🚀 القائمة"), KeyboardButton("❌ إلغاء")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="اكتب عملية… دين محمد 500",
+)
+
+# ربط نصوص أزرار اللوحة الدائمة بالمعالجات — فحص مطابقة تامة قبل التوجيه الغامض
+_REPLY_BUTTON_ROUTES = {
+    "📅 تقرير اليوم": "cmd_today",
+    "🔴 الديون": "cmd_debts",
+    "🟢 السداد": "cmd_paid",
+    "🏆 الأكبر": "cmd_top",
+    "🗂️ العملاء": "cmd_list",
+    "📊 إحصائيات": "cmd_stats",
+    "🚀 القائمة": "cmd_menu",
+    "❌ إلغاء": "cmd_cancel",
+}
+
+
+def _reply_route(text: str):
+    """يعيد دالة المعالجة إن كان النص زراً من اللوحة الدائمة، وإلا None."""
+    fn_name = _REPLY_BUTTON_ROUTES.get(text.strip())
+    if not fn_name:
+        return None
+    return globals().get(fn_name)
 
 ACTION_DEBIT = "debit"
 ACTION_CREDIT = "credit"
@@ -462,7 +500,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "• دفع علي 100   ← يسدّد\n"
         "• حساب محمد     ← الرصيد\n"
         "• دخل/مصروف 500 ← الصندوق الشخصي\n\n"
-        "او استخدم الأزرار للوصول السريع لكل التقارير والنسخ الاحتياطي."
+        "📲 اضغط أيقونة 🎛️ بجانب مربع الكتابة لإظهار/إخفاء لوحة الأزرار السريعة."
     )
     kb = [
         [
@@ -471,7 +509,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ]
     ]
     await update.effective_message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(kb)
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+    # إرسال اللوحة الدائمة (تظهر كأيقونة مضغوطة قابلة للتوسيع/الإخفاء)
+    await update.effective_message.reply_text(
+        "🎛️ اللوحة جاهزة — اضغط الأيقونة للعرض:",
+        reply_markup=REPLY_MAIN_KEYBOARD,
     )
     return ConversationHandler.END
 
@@ -528,6 +573,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "🐢 مهلاً قليلاً… أرسل رسالة منفصلة بدلاً من الإغراق."
         )
         return ConversationHandler.END
+
+    # ── أزرار اللوحة الدائمة (مطابقة تامة قبل أي توجيه غامض) ────
+    route = _reply_route(text)
+    if route is not None:
+        return await route(update, context)
 
     # ── أوامر إدارية نصية سريعة (بدون شرطة slash) ───────────
     low = text.strip().lower()
@@ -1109,33 +1159,61 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+_AGING_BUCKET_META = {
+    # label: (أيقونة، ترتيب العرض — الأقدم أولاً)
+    "متقادم": ("🔴", 0),
+    "٣ أشهر": ("🟠", 1),
+    "شهر": ("🟡", 2),
+    "أسبوع": ("🟢", 3),
+    "غير معروف": ("⚪", 4),
+}
+
+
 async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """أعمار الديون — ذكاء التحصيل: من لا يُطالَبه منذ متى؟"""
+    """أعمار الديون — ذكاء التحصيل: أقسام مضغوطة مرتبة من الأقدم، مريحة للهاتف."""
     if not is_authorized(update):
         await _guard(update)
         return ConversationHandler.END
     try:
         r = db.aging_report()
         if not r["rows"]:
-            await update.effective_message.reply_text("🎉 لا يوجد مدينون أصلاً.")
+            await update.effective_message.reply_text("🎉 لا يوجد مدينون أصلاً — كل الحسابات سليمة!")
             return ConversationHandler.END
-        table = _mono_table(
-            ["العميل", "الرصيد", "آخر حركة"],
-            [
-                [_md(c["name"]), _fmt_money(c["balance"]), f"{_hi_num(c['days'])} يوم" if c["days"] >= 0 else "؟"]
-                for c in r["rows"][:15]
-            ],
+
+        # تجميع الصفوف حسب الشريحة مع مجموع كل شريحة
+        grouped: dict[str, list[dict]] = {}
+        for row in r["rows"]:
+            grouped.setdefault(row["bucket"], []).append(row)
+
+        # ترتيب الشرائح: الأقدم أولاً
+        ordered = sorted(
+            grouped.items(),
+            key=lambda kv: _AGING_BUCKET_META.get(kv[0], ("⚪", 9))[1],
         )
-        buckets = r["buckets"]
-        summary = " · ".join(
-            f"{label}: {_hi_num(len(names))}" for label, names in buckets.items() if names
+
+        sections: list[str] = []
+        for label, items in ordered:
+            icon = _AGING_BUCKET_META.get(label, ("⚪", 9))[0]
+            b_total = sum((it["balance"] for it in items), Decimal("0.00"))
+            shown = sorted(items, key=lambda it: it["balance"], reverse=True)[:5]
+            lines = [f"{icon} *{label}* · {_hi_num(len(items))} عميل — {_fmt_money_md2(b_total)}"]
+            for it in shown:
+                days = f"{_hi_num(it['days'])} يوم" if it["days"] >= 0 else "؟"
+                lines.append(f"  • {_md(it['name'])} — {_fmt_money_md2(it['balance'])} · {days}")
+            hidden = len(items) - len(shown)
+            if hidden > 0:
+                lines.append(f"  …و {_hi_num(hidden)} آخرون")
+            sections.append("\n".join(lines))
+
+        body = "\n\n".join(sections)
+        text = (
+            f"⏳ *أعمار الديون* — الأقدم أولاً\n"
+            f"🗓️ {_md2(_fmt_dt(_local_now().isoformat(), with_time=False))}\n\n"
+            f"{body}\n\n"
+            f"💼 إجمالي الديون: *{_fmt_money_md2(r['total'])}*"
         )
         await update.effective_message.reply_text(
-            f"⏳ *أعمار الديون* \\(الأقدم أولاً\\)\n\n{table}\n\n"
-            f"🗂️ الشرائح: {summary}\n"
-            f"💼 إجمالي: *{_fmt_money_md2(r['total'])}*\n\n"
-            r"💡 ابدأ التحصيل بأصحاب الديون المتقادمة\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            text, parse_mode=ParseMode.MARKDOWN_V2
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تقرير أعمار الديون")

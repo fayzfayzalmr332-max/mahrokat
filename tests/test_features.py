@@ -507,3 +507,110 @@ def test_card_command_output(monkeypatch):
     assert "زاهر" in text
     assert "أغسطس" in text       # تاريخ عربي
     assert "٠" in text or "١" in text  # أرقام هندية
+
+
+# ── لوحة الردود الدائمة (أيقونة المربعات) ─────────────────────
+def test_reply_keyboard_persistent_config():
+    """اللوحة الدائمة: is_persistent + resize — أيقونة قابلة للطي/التوسيع."""
+    from telegram import ReplyKeyboardMarkup  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+
+    kb = botmod.REPLY_MAIN_KEYBOARD
+    assert isinstance(kb, ReplyKeyboardMarkup)
+    assert kb.is_persistent is True
+    assert kb.resize_keyboard is True
+    assert kb.input_field_placeholder
+    labels = [b.text for row in kb.keyboard for b in row]
+    for expected in ("📅 تقرير اليوم", "🔴 الديون", "🟢 السداد", "🚀 القائمة", "❌ إلغاء"):
+        assert expected in labels
+
+
+def test_reply_button_routes_resolve():
+    """كل زر في اللوحة يجب أن يرتبط بدالة معالجة موجودة فعلاً."""
+    import app.bot as botmod  # noqa: PLC0415
+
+    for label in botmod._REPLY_BUTTON_ROUTES:
+        fn = botmod._reply_route(label)
+        assert callable(fn), f"الزر {label} بلا معالج (زر ميت!)"
+    assert botmod._reply_route("نص عادي") is None
+
+
+def test_reply_button_routes_to_handler(monkeypatch):
+    """الضغط على زر اللوحة يوجّه للمعالج الصحيح مباشرة (قبل التوجيه الغامض)."""
+    import asyncio  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+
+    called = {"stats": 0}
+
+    async def fake_stats(update, context):
+        called["stats"] += 1
+        return -1
+
+    monkeypatch.setattr(botmod, "cmd_stats", fake_stats)
+
+    class _Msg:
+        text = "📊 إحصائيات"
+
+        async def reply_text(self, *a, **k):
+            return None
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        effective_message = _Msg()
+        effective_user = _Usr()
+
+    asyncio.run(botmod.handle_message(_Upd(), SimpleNamespace(bot_data={})))
+    assert called["stats"] == 1
+
+
+# ── التصميم الجديد لتقرير أعمار الديون ────────────────────────
+def test_aging_new_format_sections(monkeypatch):
+    """/aging بأقسام الشرائح: الأقدم أولاً، مجموع لكل شريحة، مقيّد بـ 5."""
+    import asyncio  # noqa: PLC0415
+    from decimal import Decimal as D  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    rows = [
+        {"name": "قديم أ", "balance": D("900"), "days": 120, "bucket": "متقادم"},
+        {"name": "قديم ب", "balance": D("800"), "days": 100, "bucket": "متقادم"},
+        {"name": "حديث", "balance": D("100"), "days": 3, "bucket": "أسبوع"},
+    ]
+    monkeypatch.setattr(
+        sdb, "aging_report",
+        lambda: {"rows": rows, "buckets": {}, "total": D("1800")},
+    )
+
+    class _Msg:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append((text, kw))
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        effective_user = _Usr()
+        effective_message = _Msg()
+        callback_query = None
+
+    upd = _Upd()
+    asyncio.run(botmod.cmd_aging(upd, SimpleNamespace(args=[])))
+    text = upd.effective_message.sent[0][0]
+    # قسم متقادم أولاً ثم أسبوع (الأقدم أولاً)
+    assert text.index("متقادم") < text.index("أسبوع")
+    # مجموع الشريحة بالأرقام الهندية (900+800)
+    assert "١,٧٠٠" in text
+    # عداد العملاء هند
+    assert "٢ عميل" in text
+    # الإجمالي العام
+    assert "١,٨٠٠" in text
