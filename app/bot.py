@@ -474,12 +474,17 @@ def _rate_limited(
     limit: int = 6,
     window: float = 6.0,
 ) -> bool:
-    """حدّ إغراق بسيط ضد سبام الرسائل — يسمح بعدد محدود خلال نافذة زمنية."""
+    """حدّ إغراق بسيط ضد سبام الرسائل — يسمح بعدد محدود خلال نافذة زمنية.
+
+    نستخدم ساعة الحائط time.time() لا time.monotonic(): لأن bot_data يُخزَّن
+    ويُحمَّل عبر عقد Serverless مختلفة، وساعة monotonic خاصة بالعملية نفسها
+    — قيمتها المخزَّنة من عقدة سابقة بلا معنى وقد تسبّب قفلاً دائماً أو تصفيراً.
+    """
     user = update.effective_user
     if not user:
         return True
     rates = context.bot_data.setdefault("_rates", {})
-    now = time.monotonic()
+    now = time.time()
     prev = rates.get(user.id)
     if prev is None or now - prev[0] >= window:
         rates[user.id] = [now, 1]
@@ -1012,7 +1017,11 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith(CALLBACK_PAGE_PREFIX):
-        page = int(data.split(":", 1)[1])
+        raw_page = data.split(":", 1)[1]
+        if not raw_page.isdigit():
+            await _safe_answer(query, "رابط غير صالح")
+            return
+        page = int(raw_page)
         customers = context.user_data.get("last_customers") or db.list_customers_with_balances()
         customers.sort(key=lambda c: to_decimal(c.get("balance", 0)), reverse=True)
         await _render_customer_page(update, context, customers, page)

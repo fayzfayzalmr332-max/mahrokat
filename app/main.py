@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 
 from app.bot import build_application
 from app.config import settings
@@ -21,8 +22,10 @@ def main() -> None:
     app = build_application(settings)
 
     if settings.webhook_url:
-        # وضع Webhook — يتطلب عنواناً عاماً HTTPS Stable
-        webhook_path = f"/webhook/{settings.telegram_token}"
+        # وضع Webhook — يتطلب عنواناً عاماً HTTPS Stable.
+        # لا نضع توكن البوت في المسار أبداً (يتسرّب في سجلات المنصة) — مسار سرّي.
+        path_secret = settings.webhook_secret_token or secrets.token_urlsafe(16)
+        webhook_path = f"/webhook/{path_secret}"
         app.run_webhook(
             listen="0.0.0.0",
             port=settings.port,

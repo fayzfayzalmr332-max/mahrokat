@@ -14,9 +14,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+
+import httpx
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
@@ -78,9 +78,11 @@ class Database:
 
     def __init__(self) -> None:
         self._base = None
+        self._client: httpx.Client | None = None
 
-    # محاولة واحدة إضافية للقراءات عند أخطاء الشبكة/الخادم العابرة
-    _RETRY_ATTEMPTS = 2
+    # ثلاث محاولات للقراءات عند أخطاء الشبكة/الخادم العابرة — DNS خاصة
+    # (getaddrinfo) قد يتعثر لحظياً ثم يعود خلال 1-3 ثوانٍ
+    _RETRY_ATTEMPTS = 3
     _RETRY_DELAY = 1.5  # ثوانٍ متصاعدة بين المحاولات
 
     def _req(
@@ -91,7 +93,7 @@ class Database:
         payload=None,
         headers: dict | None = None,
     ) -> tuple[int, list | dict]:
-        """تنفيذ طلب PostgREST مباشر وعرض نتيجة (status, body).
+        """تنفيذ طلب PostgREST عبر عميل HTTP متجمع الاتصالات (Keep-Alive).
 
         القراءات (GET) تُعاد محاولتها مرة واحدة عند أخطاء الشبكة العابرة أو
         رموز 429/5xx؛ الكتابة لا تُعاد حتى لا تُسجَّل الحركة مرتين.
@@ -100,44 +102,68 @@ class Database:
         url = f"{base}/rest/v1/{path}"
         if query:
             url += f"?{query}"
-        rq = urllib.request.Request(url, method=method)
-        headers = headers or {}
-        headers.setdefault("apikey", settings.supabase_service_role_key)
-        headers.setdefault("Authorization", f"Bearer {settings.supabase_service_role_key}")
-        headers.setdefault("Accept", "application/json")
-        headers.setdefault("Content-Type", "application/json")
+        req_headers = {
+            "apikey": settings.supabase_service_role_key,
+            "Authorization": f"Bearer {settings.supabase_service_role_key}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if headers:
+            req_headers.update(headers)
         if method in ("POST", "PATCH"):
             # يطلب إعادة السجلات المدرجة/المعدّلة حتى نعرف المعرف والبيانات
-            headers.setdefault("Prefer", "return=representation")
-        for k, v in headers.items():
-            rq.add_header(k, v)
-        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+            req_headers.setdefault("Prefer", "return=representation")
 
         attempts = self._RETRY_ATTEMPTS if method == "GET" else 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
             try:
-                with urllib.request.urlopen(rq, data=data, timeout=30) as resp:
-                    raw = resp.read().decode("utf-8")
-                    return resp.status, (json.loads(raw) if raw else [])
-            except urllib.error.HTTPError as e:
-                body = e.read().decode("utf-8", errors="replace")
-                last_exc = e
-                # أخطاء الخادم العابرة (429/5xx): محاولة قصيرة ثم نقف
-                if e.code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
-                    time.sleep(self._RETRY_DELAY * (attempt + 1))
-                    continue
-                raise RuntimeError(f"Supabase HTTP {e.code}: {body[:300]}") from e
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
-                last_exc = e
+                resp = self._get_client().request(
+                    method, url, headers=req_headers, json=payload
+                )
+                if resp.status_code >= 400:
+                    # أخطاء الخادم العابرة (429/5xx): محاولة قصيرة ثم نقف
+                    if (
+                        resp.status_code in (429, 500, 502, 503, 504)
+                        and attempt + 1 < attempts
+                    ):
+                        time.sleep(self._RETRY_DELAY * (attempt + 1))
+                        continue
+                    raise RuntimeError(
+                        f"Supabase HTTP {resp.status_code}: {resp.text[:300]}"
+                    )
+                try:
+                    body = resp.json() if resp.content else []
+                except ValueError:
+                    body = []
+                return resp.status_code, body
+            except httpx.RequestError as exc:
+                last_exc = exc
                 if attempt + 1 < attempts:
                     time.sleep(self._RETRY_DELAY * (attempt + 1))
                     continue
                 # نُوحّد أخطاء الشبكة في RuntimeError حتى يسهل التقاطها والتصنيف
                 raise RuntimeError(
-                    f"تعذّر الاتصال بـ Supabase ({type(e).__name__}): {e}"
-                ) from e
+                    f"تعذّر الاتصال بـ Supabase ({type(exc).__name__}): {exc}"
+                ) from exc
         raise RuntimeError(f"فشل الطلب {method} {path}: {last_exc}") from last_exc
+
+    def _get_client(self) -> httpx.Client:
+        """عميل HTTP واحد بتجميع اتصالات (Keep-Alive) — يبقى حياً عبر العقدة
+        الدافئة في Serverless فتلغي مصافحة TLS الجديدة لكل طلب (استجابة أسرع
+        ملحوظة على الأوامر متعددة الاستعلامات مثل /stats و /report).
+        """
+        if self._client is None:
+            self._client = httpx.Client(
+                timeout=httpx.Timeout(
+                    connect=10.0, read=30.0, write=30.0, pool=5.0
+                ),
+                limits=httpx.Limits(
+                    max_connections=20, max_keepalive_connections=10
+                ),
+                follow_redirects=False,
+            )
+        return self._client
 
     def _get_base(self) -> str:
         u = settings.supabase_url.rstrip("/")

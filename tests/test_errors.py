@@ -1,7 +1,6 @@
 """اختبارات تصنيف الأخطاء وإعادة محاولة الشبكة في services._req."""
 
-import urllib.error
-import urllib.request
+import httpx
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -62,68 +61,58 @@ def db() -> Database:
     return inst
 
 
-def test_req_retries_get_on_transient_urlerror(monkeypatch, db):
+def test_req_retries_get_on_transient_error(monkeypatch, db):
     calls = {"n": 0}
 
-    def fake_urlopen(req, data=None, timeout=30):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise urllib.error.URLError("boom")
+    class FakeClient:
+        def request(self, method, url, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("boom")
+            return httpx.Response(200, json=[{"id": 1}])
 
-        class FakeResp:
-            def __init__(self):
-                self.status = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self):
-                return b'[{"id": 1}]'
-
-        return FakeResp()
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(db, "_get_client", lambda: FakeClient())
     status, body = db._req("GET", "customers", "select=id")
     assert status == 200
     assert body == [{"id": 1}]
     assert calls["n"] == 2
 
 
-def test_req_raises_on_persistent_urlerror(monkeypatch, db):
+def test_req_raises_on_persistent_error(monkeypatch, db):
     calls = {"n": 0}
 
-    def fake_urlopen(req, data=None, timeout=30):
-        calls["n"] += 1
-        raise urllib.error.URLError("boom")
+    class FakeClient:
+        def request(self, method, url, **kwargs):
+            calls["n"] += 1
+            raise httpx.ConnectError("boom")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(db, "_get_client", lambda: FakeClient())
     with pytest.raises(RuntimeError, match="تعذّر الاتصال"):
         db._req("GET", "customers", "select=id")
-    assert calls["n"] == 2
+    assert calls["n"] == 3  # ثلاث محاولات للقراءات قبل الاستسلام
 
 
 def test_req_does_not_retry_post(monkeypatch, db):
     # حتى لا تُسجَّل الحركة المالية مرتين عند أي خطأ عابر
     calls = {"n": 0}
 
-    def fake_urlopen(req, data=None, timeout=30):
-        calls["n"] += 1
-        raise urllib.error.URLError("boom")
+    class FakeClient:
+        def request(self, method, url, **kwargs):
+            calls["n"] += 1
+            raise httpx.ConnectError("boom")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(db, "_get_client", lambda: FakeClient())
     with pytest.raises(RuntimeError):
         db._req("POST", "transactions", payload={})
     assert calls["n"] == 1
 
 
 def test_req_http_error_still_runtimeerror(monkeypatch, db):
-    def fake_urlopen(req, data=None, timeout=30):
-        raise urllib.error.HTTPError(url="u", code=500, msg="", hdrs={}, fp=None)
+    class FakeClient:
+        def request(self, method, url, **kwargs):
+            return httpx.Response(500, text="boom")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(db, "_get_client", lambda: FakeClient())
     with pytest.raises(RuntimeError, match="Supabase HTTP 500"):
         db._req("GET", "customers")
 

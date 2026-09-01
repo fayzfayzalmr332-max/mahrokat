@@ -642,6 +642,61 @@ def test_pending_state_still_rejects_free_text():
     assert result == botmod.STATE_PENDING_CONFIRM
     assert any("بانتظار التأكيد" in s for s in upd.effective_message.sent)
 
+def test_malformed_page_callback_does_not_crash():
+    """زر تنقّل بمعرّف صفحة غير رقمي (page:abc) يجب ألا يرمي خطأً — يُرفض
+    بأمان بدل كسر معالج الأزرار (كان int() يرمي ValueError سابقاً)."""
+    import asyncio  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+
+    class _Q:
+        def __init__(self):
+            self.data = "page:abc"
+            self.answered = []
+            self.edited = []
+
+        async def answer(self, text=None, **kw):
+            self.answered.append(text)
+
+        async def edit_message_text(self, text=None, **kw):
+            self.edited.append(text)
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        callback_query = _Q()
+        effective_user = _Usr()
+
+    upd = _Upd()
+    ctx = SimpleNamespace(bot_data={}, user_data={})
+    asyncio.run(botmod.on_nav_callback(upd, ctx))
+    # رُفض بأمان دون أي محاولة تعديل رسالة (لا قفلة ولا خطأ)
+    assert upd.callback_query.edited == []
+
+
+def test_rate_limited_allows_then_blocks():
+    """حدّ الإغراق: يسمح بعدد محدود خلال النافذة ثم يحجب — عبر ساعة حائط
+    متوافقة مع التخزين الدائم عبر عقد Serverless المختلفة."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+
+    user = SimpleNamespace(id=settings.owner_telegram_id)
+    update = SimpleNamespace(effective_user=user)
+    context = SimpleNamespace(bot_data={})
+    allowed = 0
+    blocked = 0
+    for _ in range(12):
+        if botmod._rate_limited(update, context):
+            blocked += 1
+        else:
+            allowed += 1
+    assert allowed == 6
+    assert blocked == 6
+
+
 
 # ── التصميم الجديد لتقرير أعمار الديون ────────────────────────
 def test_aging_new_format_sections(monkeypatch):

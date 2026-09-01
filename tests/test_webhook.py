@@ -1,6 +1,17 @@
 """اختبارات واجهة Webhook الخاصة بنشر Vercel (Serverless)."""
 
+import pytest
+
 from app.config import settings
+
+
+@pytest.fixture(autouse=True)
+def _reset_secret_cache_between_tests():
+    """يصفّر كاش الرمز السري قبل وبعد كل اختبار لعزل كامل بين الاختبارات."""
+    m = _webhook_module()
+    m._reset_secret_cache()
+    yield
+    m._reset_secret_cache()
 
 
 def _webhook_module():
@@ -135,6 +146,37 @@ def test_webhook_auto_provisions_secret_from_db(monkeypatch):
         assert calls["set"] is not None
         assert calls["set"][0] == m._SECRET_SETTING_KEY
         assert calls["set"][1] == secret
+    finally:
+        object.__setattr__(settings, "webhook_secret_token", original)
+
+
+def test_webhook_secret_cached_after_provision(monkeypatch):
+    """الرمز السري المستخرج من قاعدة البيانات يُخزَّن مؤقتاً — قراءة واحدة
+    لكل عقدة دافئة بدل قراءة لكل تحديث (أداء Serverless)."""
+    import api.webhook as m  # noqa: PLC0415
+
+    original = settings.webhook_secret_token
+    object.__setattr__(settings, "webhook_secret_token", None)
+    calls = {"get": 0, "set": 0}
+
+    def fake_get(key):
+        calls["get"] += 1
+        return ""
+
+    def fake_set(key, value):
+        calls["set"] += 1
+
+    monkeypatch.setattr(m.db, "get_setting", fake_get)
+    monkeypatch.setattr(m.db, "set_setting", fake_set)
+    try:
+        first = m._webhook_secret()
+        assert first and len(first) >= 32
+        assert calls["get"] == 1
+        assert calls["set"] == 1
+        second = m._webhook_secret()
+        assert second == first
+        assert calls["get"] == 1  # الكاش: لا قراءة إضافية من قاعدة البيانات
+        assert calls["set"] == 1
     finally:
         object.__setattr__(settings, "webhook_secret_token", original)
 

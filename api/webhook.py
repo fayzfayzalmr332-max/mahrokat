@@ -39,6 +39,16 @@ logger = logging.getLogger(__name__)
 _application = None
 _SECRET_SETTING_KEY = "webhook_secret_v1"
 
+# كاش الرمز السري المستخرج من قاعدة البيانات — يبقى عبر العقدة الدافئة
+# فيلغي قراءة app_settings لكل تحديث (أداء Serverless). يُصفَّر فقط في الاختبارات.
+_secret_cache: dict = {"loaded": False, "value": None}
+
+
+def _reset_secret_cache() -> None:
+    """إعادة تعيين كاش الرمز السري (للاستخدام في الاختبارات فقط)."""
+    _secret_cache["loaded"] = False
+    _secret_cache["value"] = None
+
 
 def _webhook_secret() -> str | None:
     """الرمز السري الإلزامي للـ Webhook.
@@ -49,12 +59,18 @@ def _webhook_secret() -> str | None:
     """
     if settings.webhook_secret_token:
         return settings.webhook_secret_token
+    if _secret_cache["loaded"]:
+        return _secret_cache["value"]
     try:
         existing = db.get_setting(_SECRET_SETTING_KEY)
         if existing:
+            _secret_cache["value"] = existing
+            _secret_cache["loaded"] = True
             return existing
         generated = _pysecrets.token_urlsafe(32)
         db.set_setting(_SECRET_SETTING_KEY, generated)
+        _secret_cache["value"] = generated
+        _secret_cache["loaded"] = True
         logger.info("تم توليد رمز سرّي للـ Webhook وتخزينه في قاعدة البيانات")
         return generated
     except Exception:  # noqa: BLE001
