@@ -11,7 +11,6 @@ numeric(15,2). لا نستخدم float في التخزين إطلاقاً.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import urllib.parse
