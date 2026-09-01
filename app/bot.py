@@ -185,27 +185,27 @@ def _fmt_money(value) -> str:
     return _hi_num(s)
 
 
-# ── أرقام هندية (٠-٩) وتواريخ عربية احترافية ─────────────────
-_ARABIC_INDIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+# ── أرقام غربية (0-9) وتواريخ رقمية واضحة ─────────────────────
+# القرار: كل الأرقام في الرسائل تُعرض بالنظام الغربي فقط (المبالغ والتواريخ
+# والعدادات) للوضوح وسهولة القراءة على الهاتف.
 
 
 def _hi_num(text: object) -> str:
-    """تحويل الأرقام الغربية إلى أرقام هندية (٠١٢٣٤٥٦٧٨٩) — تستخدم في
-    المبالغ والتواريخ والعدادات داخل الرسائل لعرض عربي أنيق ومحترف."""
-    return str(text or "").translate(_ARABIC_INDIC)
+    """دالة توافقية: تُرجع النص كما هو بأرقام غربية (0-9) دون أي تحويل.
+
+    كانت سابقاً تحوّل الأرقام إلى هندية (٠-٩) — أُلغي التحويل نهائياً
+    حسب متطلب المستخدم «جميع الأرقام أجنبية فقط».
+    """
+    return str(text or "")
 
 
-_AR_MONTHS = [
-    "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
-    "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
-]
 _AR_WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
 
 
 def _fmt_dt(iso: object, with_time: bool = True) -> str:
-    """تنسيق ISO (UTC) إلى تاريخ عربي مقروء حسب توقيت المحطة + أرقام هندية.
+    """تنسيق ISO (UTC) إلى تاريخ رقمي غربي واضح حسب توقيت المحطة.
 
-    مثال: «الخميس ٢٠ أكتوبر ٢٠٢٦ · ١٢:٣٤ م»
+    مثال: «2026/8/29 الأحد» أو «2026/8/29 الأحد · 9:05 م»
     """
     if not iso:
         return "—"
@@ -213,15 +213,14 @@ def _fmt_dt(iso: object, with_time: bool = True) -> str:
         dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
         local = dt.astimezone(timezone(timedelta(hours=env_settings.timezone_offset)))
     except Exception:  # noqa: BLE001
-        return _hi_num(str(iso)[:16])
+        return str(iso)[:16]
     day = _AR_WEEKDAYS[local.weekday()]
-    date = f"{_hi_num(local.day)} {_AR_MONTHS[local.month - 1]} {_hi_num(local.year)}"
+    date = f"{local.year}/{local.month}/{local.day} {day}"
     if not with_time:
-        return f"{day} {date}"
+        return date
     h12 = local.hour % 12 or 12
     ampm = "ص" if local.hour < 12 else "م"
-    time_s = f"{_hi_num(h12)}:{_hi_num(f'{local.minute:02d}')} {ampm}"
-    return f"{day} {date} · {time_s}"
+    return f"{date} · {h12}:{local.minute:02d} {ampm}"
 
 
 def _md(text: object) -> str:
@@ -796,6 +795,11 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data.pop("pending_tx", None)
     return ConversationHandler.END
 async def _show_balance(update: Update, name: str) -> None:
+    """بطاقة رصيد احترافية: الرصيد المتبقي + آخر الحركات مرتبة ومصنّفة.
+
+    «حساب <الاسم>» يعرض الرصيد المتبقي للعميل بوضوح ثم آخر 5 حركات
+    (دين 🔺 / سداد 🔻) مع التاريخ الرقمي — منظمة ومفهومة على الهاتف.
+    """
     try:
         cust = db.find_customer(name)
         if not cust:
@@ -806,17 +810,30 @@ async def _show_balance(update: Update, name: str) -> None:
             return
         balance = db.get_balance(cust["id"])
         activity = db.get_activity(cust["id"], limit=5)
-        lines = [f"💳 الرصيد الحالي — *{_md(cust['name'])}*: *{_fmt_money(balance)}*"]
+
+        lines = [
+            f"💳 *بطاقة العميل* — {_md(cust['name'])}",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"🔴 الرصيد المتبقي: *{_fmt_money(balance)}*",
+        ]
         if activity:
-            lines.append("\n*آخر الحركات:*")
-            for r in activity:
+            lines += ["", f"📋 *آخر الحركات ({_hi_num(len(activity))}):*"]
+            for i, r in enumerate(activity, start=1):
                 amt = abs(to_decimal(r.get("amount", 0)))
-                arrow = "+" if r.get("tx_type") == "debit" else "−"
-                lines.append(f"{arrow}{_fmt_money(amt)} · {_fmt_dt(r.get('created_at'))}")
+                kind = "دين" if r.get("tx_type") == "debit" else "سداد"
+                icon = "🔺" if kind == "دين" else "🔻"
+                note = r.get("note")
+                note_s = f" · {_md(str(note))}" if note else ""
+                lines.append(
+                    f"• {_hi_num(i)}) {icon} {kind} {_fmt_money(amt)}{note_s}\n"
+                    f"    🕓 {_fmt_dt(r.get('created_at'))}"
+                )
+        else:
+            lines += ["", "— لا توجد حركات مسجلة لهذا العميل بعد."]
         await update.effective_message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.MARKDOWN
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("فشل عرض الرصيد")
         await update.effective_message.reply_text("خطأ في جلب الرصيد. حاول مجدداً.")
 
@@ -1652,10 +1669,10 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             ),
         ],
         [
-            InlineKeyboardButton("٧ أيام", callback_data=f"{CALLBACK_ALERT_PREFIX}days:7"),
-            InlineKeyboardButton("١٥", callback_data=f"{CALLBACK_ALERT_PREFIX}days:15"),
-            InlineKeyboardButton("٣٠", callback_data=f"{CALLBACK_ALERT_PREFIX}days:30"),
-            InlineKeyboardButton("٦٠", callback_data=f"{CALLBACK_ALERT_PREFIX}days:60"),
+            InlineKeyboardButton("7 أيام", callback_data=f"{CALLBACK_ALERT_PREFIX}days:7"),
+            InlineKeyboardButton("15", callback_data=f"{CALLBACK_ALERT_PREFIX}days:15"),
+            InlineKeyboardButton("30", callback_data=f"{CALLBACK_ALERT_PREFIX}days:30"),
+            InlineKeyboardButton("60", callback_data=f"{CALLBACK_ALERT_PREFIX}days:60"),
         ],
     ]
     if update.callback_query:

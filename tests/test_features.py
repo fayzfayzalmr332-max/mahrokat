@@ -382,55 +382,51 @@ def test_weekly_alert_is_markdownv2_safe(monkeypatch):
 
 
 # ── الأرقام الهندية والتواريخ العربية ─────────────────────────
-def test_hi_num_converts_digits():
-    """المبالغ والعدادات يجب أن تُعرض بأرقام هندية (٠-٩)."""
+def test_hi_num_keeps_western_digits():
+    """كل الأرقام يجب أن تبقى غربية (0-9) في جميع الرسائل."""
     import app.bot as botmod  # noqa: PLC0415
 
-    assert botmod._hi_num("1234567890") == "١٢٣٤٥٦٧٨٩٠"
-    assert botmod._hi_num("0") == "٠"
+    assert botmod._hi_num("1234567890") == "1234567890"
+    assert botmod._hi_num("0") == "0"
     assert botmod._hi_num(None) == ""
     assert botmod._hi_num("") == ""
-    # لا يغيّر الحروف
+    # لا أرقام هندية ولا يغيّر الحروف
+    assert "١٢٣" not in botmod._hi_num("123")
     assert "م" in botmod._hi_num("م 123 م")
 
 
-def test_fmt_money_uses_indian_digits():
+def test_fmt_money_uses_western_digits():
     from decimal import Decimal  # noqa: PLC0415
 
     import app.bot as botmod  # noqa: PLC0415
-
-    with_monkeypatch_currency = ""
-
-    old_currency = None
-    import app.config as cmod  # noqa: PLC0415
 
     s = botmod.env_settings
     old_curr = getattr(s, "currency", "")
     object.__setattr__(s, "currency", "")
     try:
         out = botmod._fmt_money(Decimal("1234.50"))
-        assert "١" in out and "٢" in out and "٤" in out  # أرقام هندية
-        assert any(c in "٠١٢٣٤٥٦٧٨٩" for c in out)
+        assert out == "1,234.50"
+        assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in out)
     finally:
         object.__setattr__(s, "currency", old_curr)
 
 
-def test_fmt_dt_arabic_format():
+def test_fmt_dt_western_numeric_format():
     import app.bot as botmod  # noqa: PLC0415
 
-    # ISO واحد معروف → اليوم يُستنتج حسب timezone_offset (افتراضياً +3)
+    # ISO معروف → اليوم يُستنتج حسب timezone_offset (افتراضياً +3)
     out = botmod._fmt_dt("2026-08-20T10:30:00+00:00")
-    assert "أغسطس" in out       # الشهر عربي
-    assert "الخميس" in out      # اليوم عربي
-    assert "٠" in out or "١" in out  # أرقام هندية
-    assert "م" in out or "ص" in out  # صباحاً/مساءً
+    assert "2026/8/20 الخميس" in out   # تاريخ رقمي غربي + اليوم
+    assert "أغسطس" not in out           # لا أسماء شهور عربية
+    assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in out)  # لا أرقام هندية
+    assert "م" in out or "ص" in out     # صباحاً/مساءً
 
 
 def test_fmt_dt_no_time():
     import app.bot as botmod  # noqa: PLC0415
 
     out = botmod._fmt_dt("2026-08-20T10:30:00+00:00", with_time=False)
-    assert out == "الخميس ٢٠ أغسطس ٢٠٢٦"  # تاريخ فقط، بلا وقت، بأرقام هندية
+    assert out == "2026/8/20 الخميس"  # تاريخ فقط، بلا وقت، بأرقام غربية
 
 
 def test_fmt_dt_empty_returns_dash():
@@ -459,7 +455,7 @@ def test_card_command_registered_and_menu_mapped():
 
 
 def test_card_command_output(monkeypatch):
-    """ينفّذ /card فعلياً ويعرض بطاقة بأرقام هندية وتواريخ عربية."""
+    """ينفّذ /card فعلياً ويعرض بطاقة بتواريخ رقمية وأرقام غربية."""
     import asyncio  # noqa: PLC0415
     from decimal import Decimal as D  # noqa: PLC0415
     from types import SimpleNamespace  # noqa: PLC0415
@@ -505,8 +501,59 @@ def test_card_command_output(monkeypatch):
     assert upd.effective_message.sent
     text = upd.effective_message.sent[0][0]
     assert "زاهر" in text
-    assert "أغسطس" in text       # تاريخ عربي
-    assert "٠" in text or "١" in text  # أرقام هندية
+    assert "2026/8/20" in text          # تاريخ رقمي غربي
+    assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
+
+
+def test_show_balance_professional_output(monkeypatch):
+    """«حساب <الاسم>» يعرض بطاقة رصيد هندسية: الرصيد المتبقي + آخر الحركات
+    مصنّفة (دين/سداد) بتواريخ رقمية وأرقام غربية."""
+    import asyncio  # noqa: PLC0415
+    from decimal import Decimal as D  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    class _Msg:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append((text, kw))
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        effective_message = _Msg()
+        effective_user = _Usr()
+
+    monkeypatch.setattr(sdb, "find_customer", lambda name: {"id": "c1", "name": "عبدو"})
+    monkeypatch.setattr(sdb, "get_balance", lambda cid: D("0.00"))
+    monkeypatch.setattr(
+        sdb,
+        "get_activity",
+        lambda cid, limit=5: [
+            {"amount": "-7200", "tx_type": "credit", "note": None,
+             "created_at": "2026-08-31T18:05:00+00:00"},
+            {"amount": "7000", "tx_type": "debit", "note": None,
+             "created_at": "2026-08-31T13:16:00+00:00"},
+        ],
+    )
+
+    upd = _Upd()
+    asyncio.run(botmod._show_balance(upd, "عبدو"))
+    assert upd.effective_message.sent
+    text = upd.effective_message.sent[0][0]
+    assert "بطاقة العميل" in text
+    assert "الرصيد المتبقي" in text
+    assert "عبدو" in text
+    assert "0.00" in text
+    # الحركات مصنّفة بالنوع
+    assert "سداد" in text and "دين" in text
+    # تاريخ رقمي غربي (توقيت +3: 18:05 UTC → 21:05، 13:16 UTC → 16:16)
+    assert "2026/8/31" in text
+    assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
 
 
 # ── لوحة الردود الدائمة (أيقونة المربعات) ─────────────────────
@@ -738,9 +785,9 @@ def test_aging_new_format_sections(monkeypatch):
     text = upd.effective_message.sent[0][0]
     # قسم متقادم أولاً ثم أسبوع (الأقدم أولاً)
     assert text.index("متقادم") < text.index("أسبوع")
-    # مجموع الشريحة بالأرقام الهندية (900+800)
-    assert "١,٧٠٠" in text
-    # عداد العملاء هند
-    assert "٢ عميل" in text
+    # مجموع الشريحة بالأرقام الغربية (900+800)
+    assert "1,700" in text
+    # عداد العملاء
+    assert "2 عميل" in text
     # الإجمالي العام
-    assert "١,٨٠٠" in text
+    assert "1,800" in text
