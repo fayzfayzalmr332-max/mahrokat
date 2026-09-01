@@ -568,16 +568,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return ConversationHandler.END
 
+    # ── أزرار اللوحة الدائمة (مطابقة تامة — قبل محدد السرعة لأنها
+    # ضغطات مقصودة منفردة وليست إغراقاً نصياً) ────
+    route = _reply_route(text)
+    if route is not None:
+        return await route(update, context)
+
     if _rate_limited(update, context):
         await update.effective_message.reply_text(
             "🐢 مهلاً قليلاً… أرسل رسالة منفصلة بدلاً من الإغراق."
         )
         return ConversationHandler.END
-
-    # ── أزرار اللوحة الدائمة (مطابقة تامة قبل أي توجيه غامض) ────
-    route = _reply_route(text)
-    if route is not None:
-        return await route(update, context)
 
     # ── أوامر إدارية نصية سريعة (بدون شرطة slash) ───────────
     low = text.strip().lower()
@@ -689,6 +690,13 @@ async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("pending_tx", None)
         await update.effective_message.reply_text("تم إلغاء العملية. ❌")
         return ConversationHandler.END
+
+    # أزرار اللوحة الدائمة أثناء الانتظار: ننفّذ طلبها فوراً *مع الاحتفاظ*
+    # بالعملية المعلقة — المستخدم يتصفح تقاريره دون فقدان تأكيد العملية.
+    route = _reply_route(text)
+    if route is not None:
+        await route(update, context)
+        return STATE_PENDING_CONFIRM
 
     await update.effective_message.reply_text(
         "يوجد عملية بانتظار التأكيد. ردّ بنعم أو لا، أو أرسل /cancel."
@@ -1249,12 +1257,18 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await _guard(update)
         return ConversationHandler.END
     try:
-        s = db.stats()
-        try:
-            _, debtors = db.list_debtors()
+        # stats + قائمة المدينين بالتوازي — نصف الزمن تقريباً
+        def _debtors_safe():
+            try:
+                return db.list_debtors()
+            except Exception:  # noqa: BLE001
+                logger.warning("تعذّر جلب المدينين — نكمل بدونهم")
+                return ([], None)
+
+        s, debtors_res = db.run_parallel([db.stats, _debtors_safe])
+        debtors, debtors_count = debtors_res
+        if debtors_count is not None:
             debtors_count = len(debtors)
-        except Exception:  # noqa: BLE001
-            debtors_count = None
         rate = (
             f"{_hi_num(f'{(s['total_paid'] / s['total_debts'] * 100):.1f}')}%"
             if s["total_debts"] > 0

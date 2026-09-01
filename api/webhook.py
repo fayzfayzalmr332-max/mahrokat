@@ -27,6 +27,10 @@ from flask import Flask, Response, request
 from app.bot import build_application
 from app.config import settings
 from app.services import db
+try:  # على Vercel: مجلد api على sys.path مباشرة
+    from runtime import run_coro
+except ImportError:  # محلياً/اختبارات: استيراد نسبي كحزمة
+    from .runtime import run_coro  # type: ignore[no-redef]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -67,34 +71,20 @@ def get_application():
 
 
 async def _ensure_ready() -> None:
-    """تهيئة التطبيق مرة واحدة (idempotent) قبل أي معالجة."""
+    """تهيئة التطبيق مرة واحدة لكل عقدة دافئة (idempotent) — بلا shutdown.
+
+    مع الحلقة الدائمة (api/runtime.py) لا تُغلق الحلقة بين الطلبات، فتبقى
+    عملاء httpx صالحة ولا حاجة لإعادة التهيئة — ضريبة الصفر لكل طلب.
+    """
     await get_application().initialize()
 
 
 async def _set_webhook(url: str) -> dict:
     await _ensure_ready()
-    try:
-        await get_application().bot.set_webhook(
-            url=url, secret_token=_webhook_secret()
-        )
-    finally:
-        # دورة حياة كاملة لكل طلب (Serverless): كل loop له عملاء شبكة طازة
-        await _safe_shutdown(get_application())
+    await get_application().bot.set_webhook(
+        url=url, secret_token=_webhook_secret()
+    )
     return {"ok": True, "url": url, "secret": "enabled"}
-
-
-async def _safe_shutdown(application) -> None:
-    """إغلاق موارد التطبيق في نهاية كل طلب.
-
-    في بيئة Serverless كل طلب يعمل على event loop جديد يُغلق بعده؛ إن بقيت
-    عملاء httpx مربوطة بـ loop مُغلق فشل كل طلب لاحق على العقدة الدافئة
-    بخطأ «Event loop is closed». الإغلاق ثم إعادة التهيئة لكل طلب هو النمط
-    الرسمي الموصى به لـ PTB في Serverless (Lambda/Vercel).
-    """
-    try:
-        await application.shutdown()
-    except Exception:  # noqa: BLE001
-        logger.exception("تعذّر إغلاق موارد التطبيق (سيُعاد تهيئتها في الطلب التالي)")
 
 
 async def _process_update(payload: dict) -> None:
@@ -114,8 +104,6 @@ async def _process_update(payload: dict) -> None:
                 await persistence.flush()
             except Exception:  # noqa: BLE001
                 logger.exception("فشل حفظ الحالة بعد معالجة التحديث")
-        # ثم إغلاق موارد الشبكة المرتبطة بالـ loop الحالي (انظر _safe_shutdown)
-        await _safe_shutdown(application)
 
 
 app = Flask(__name__)
@@ -136,7 +124,7 @@ def _setup_webhook() -> Response:
         host = host.split("://", 1)[1]
     url = f"https://{host}/api/webhook"
     try:
-        result = asyncio.run(_set_webhook(url))
+        result = run_coro(_set_webhook(url))
         return Response(json.dumps(result), mimetype="application/json", status=200)
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تسجيل الـ Webhook")
@@ -177,7 +165,7 @@ def _handle_update() -> Response:
         return Response(json.dumps({"ok": True}), mimetype="application/json", status=200)
 
     try:
-        asyncio.run(_process_update(payload))
+        run_coro(_process_update(payload))
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل معالجة التحديث")
         return Response(

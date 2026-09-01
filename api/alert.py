@@ -19,6 +19,11 @@ from types import SimpleNamespace
 
 from flask import Flask, Response, request
 
+try:  # على Vercel: مجلد api على sys.path مباشرة
+    from runtime import run_coro
+except ImportError:  # محلياً/اختبارات: استيراد نسبي كحزمة
+    from .runtime import run_coro  # type: ignore[no-redef]
+
 from app.bot import _weekly_alert_job, build_application
 from app.config import settings
 
@@ -50,18 +55,14 @@ def _is_authorized_cron() -> tuple[bool, str]:
 
 async def _run_alert() -> None:
     application = get_application()
-    await application.initialize()  # idempotent
+    await application.initialize()  # idempotent — مرة واحدة لكل عقدة دافئة
     try:
         # SimpleNamespace يحاكي context الذي تتوقعه _weekly_alert_job
         context = SimpleNamespace(bot=application.bot, bot_data={})
         await _weekly_alert_job(context)
-    finally:
-        # دورة حياة كاملة لكل استدعاء (Serverless): إغلاق عملاء الشبكة
-        # المرتبطة بالـ loop الحالي حتى لا تفشل الاستدعاءات الدافئة اللاحقة.
-        try:
-            await application.shutdown()
-        except Exception:  # noqa: BLE001
-            logger.exception("تعذّر إغلاق موارد التطبيق بعد التنبيه")
+    except Exception:  # noqa: BLE001
+        logger.exception("فشل تنفيذ منطق التنبيه")
+        raise
 
 
 app = Flask(__name__)
@@ -78,7 +79,7 @@ def run_alert():
             status=401,
         )
     try:
-        asyncio.run(_run_alert())
+        run_coro(_run_alert())
         logger.info("نُفِّذ تنبيه العملاء غير النشطين (%s)", reason)
         return Response(json.dumps({"ok": True}), mimetype="application/json", status=200)
     except Exception as exc:  # noqa: BLE001

@@ -107,9 +107,8 @@ def test_webhook_processes_real_update(monkeypatch):
     assert dummy.processed[0].update_id == 1
     # الحالة (Persistence) يجب أن تُحفظ بعد كل تحديث
     assert dummy.persistence.flushed is True
-    # دورة الحياة الكاملة: يجب إغلاق الموارد بعد كل طلب (Serverless) —
-    # يمنع انحدار «Event loop is closed» على العقد الدافئة
-    assert dummy.shutdown_called is True
+    # البنية الجديدة: لا shutdown لكل طلب — الموارد تبقى حية عبر الحلقة الدائمة
+    assert dummy.shutdown_called is False
 
 
 def test_webhook_auto_provisions_secret_from_db(monkeypatch):
@@ -188,13 +187,12 @@ def test_alert_accepts_vercel_cron_header(monkeypatch):
     assert called["n"] == 1
 
 
-def test_application_lifecycle_across_event_loops(monkeypatch):
-    """طلبان متتاليان لكلٍّ منهما event loop خاص (وضع Vercel الدافئ) مع تطبيق
-    PTB حقيقي — يمنع انحدار:
+def test_two_updates_on_persistent_loop(monkeypatch):
+    """طلبان متتاليان على الحلقة الدائمة (نمط Vercel الدافئ) مع تطبيق PTB حقيقي
+    ودون أي shutdown بينهما — يمنع انحدار:
     «Unknown error in HTTP implementation: RuntimeError(Event loop is closed)».
+    البنية الجديدة: الحلقة تبقى حية والتطبيق يُهيَّأ مرة واحدة فقط.
     """
-    import asyncio  # noqa: PLC0415
-
     import api.webhook as m  # noqa: PLC0415
     from app.bot import build_application  # noqa: PLC0415
     from telegram.ext._extbot import ExtBot  # noqa: PLC0415
@@ -235,13 +233,20 @@ def test_application_lifecycle_across_event_loops(monkeypatch):
         },
     }
 
-    # طلبان متتاليان — كل asyncio.run يعمل على loop جديد يُغلق بعده.
-    # قبل الإصلاح كان الطلب الثاني يفشل بـ «Event loop is closed».
+    # طلبان متتاليان عبر الحلقة الدائمة — نفس الحلقة، بلا إغلاق، بلا إعادة تهيئة
     for _ in range(2):
-        asyncio.run(m._process_update(payload))
+        m.run_coro(m._process_update(payload))
 
-    # الحالة دُوّرت عبر الأقراص (flush) خلال الدورة
+    # التطبيق ما زال مهيأً (لم يُغلق بين الطلبات)
+    assert app._initialized is True  # noqa: SLF001
+
+    # التحقق من دورة الحفظ الكاملة ضد الحلقة الدائمة:
+    #  الـ cache مملوء من initialize؛ نجعل الحالة متسخة ثم نكتب عبر الحلقة.
+    app.persistence._dirty = True  # noqa: SLF001
+    m.run_coro(app.persistence.flush())
     assert "ptb_persistence_v1" in store
+    # والمحتوى قُرئ وقُدّم للدمج — أي قراءة لاحقة تُعيد ما كُتب
+    assert store["ptb_persistence_v1"] != ""
 
 
 def test_alert_accepts_bearer_cron_secret(monkeypatch):

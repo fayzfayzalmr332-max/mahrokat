@@ -353,6 +353,16 @@ class Database:
             rows.sort(key=lambda c: c["balance"], reverse=True)
         return rows
 
+    def run_parallel(self, fns: list) -> list:
+        """تنفيذ عدة استعلامات مستقلة بالتوازي (خيوط) — يقلص زمن التقارير
+        المركبة إلى زمن أبطأ استعلام بدلاً من مجموعها."""
+        if not fns:
+            return []
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, len(fns))) as ex:
+            return list(ex.map(lambda f: f(), fns))
+
     def stats(self) -> dict:
         """إحصائيات عامة — عبر View واحدة (طالب واحد بدل 3 طلبات وجلب كل الصفوف)."""
         try:

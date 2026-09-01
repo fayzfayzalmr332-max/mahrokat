@@ -569,6 +569,81 @@ def test_reply_button_routes_to_handler(monkeypatch):
 
 
 # ── التصميم الجديد لتقرير أعمار الديون ────────────────────────
+def test_pending_state_allows_reply_buttons(monkeypatch):
+    """زر اللوحة أثناء انتظار تأكيد عملية: ينفَّذ فوراً مع الاحتفاظ بالعملية —
+    هذا كان سبب «الأزرار الميتة» الشكوى الأساسية."""
+    import asyncio  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+
+    ran = {"list": 0}
+
+    async def fake_list(update, context):
+        ran["list"] += 1
+        return -1
+
+    monkeypatch.setattr(botmod, "cmd_list", fake_list)
+
+    class _Msg:
+        text = "🗂️ العملاء"
+
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append(text)
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        effective_message = _Msg()
+        effective_user = _Usr()
+        callback_query = None
+
+    upd = _Upd()
+    ctx = SimpleNamespace(bot_data={}, user_data={"pending_tx": {"amount": "500"}})
+    result = asyncio.run(botmod.handle_pending(upd, ctx))
+    # القائمة نُفذت فوراً
+    assert ran["list"] == 1
+    # العملية المعلقة ما زالت محفوظة (لم تُفقد)
+    assert "pending_tx" in ctx.user_data
+    # ما زلنا في حالة الانتظار
+    assert result == botmod.STATE_PENDING_CONFIRM
+
+
+def test_pending_state_still_rejects_free_text():
+    import asyncio  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+
+    class _Msg:
+        text = "نص عادي ليس زراً"
+
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append(text)
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        effective_message = _Msg()
+        effective_user = _Usr()
+        callback_query = None
+
+    upd = _Upd()
+    ctx = SimpleNamespace(bot_data={}, user_data={"pending_tx": {"amount": "500"}})
+    result = asyncio.run(botmod.handle_pending(upd, ctx))
+    assert result == botmod.STATE_PENDING_CONFIRM
+    assert any("بانتظار التأكيد" in s for s in upd.effective_message.sent)
+
+
+# ── التصميم الجديد لتقرير أعمار الديون ────────────────────────
 def test_aging_new_format_sections(monkeypatch):
     """/aging بأقسام الشرائح: الأقدم أولاً، مجموع لكل شريحة، مقيّد بـ 5."""
     import asyncio  # noqa: PLC0415
