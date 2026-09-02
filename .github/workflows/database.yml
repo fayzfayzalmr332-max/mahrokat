@@ -59,6 +59,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: تهيئة أدوار Supabase المعيارية (محاكاة Supabase على Postgres خام)
+        run: >
+          psql -h localhost -U postgres -d mahrokat -v ON_ERROR_STOP=1
+          -f supabase/ci_bootstrap.sql
+
       - name: تطبيق المخطط الموحد — الضربة الأولى
         run: >
           psql -h localhost -U postgres -d mahrokat -v ON_ERROR_STOP=1
