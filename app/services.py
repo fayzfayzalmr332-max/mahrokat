@@ -547,6 +547,63 @@ class Database:
         q = urllib.parse.urlencode({"id": f"eq.{customer_id}"})
         self._req("DELETE", "customers", q)
 
+    def merge_customer(self, source_id: str, target_id: str) -> dict:
+        """دمج حسابين (مصدر ← هدف) — يحوّل كل حركات المصدر للهدف ثم يحذف المصدر.
+
+        يُستخدم لتوحيد الأسماء المكررة. يُشترط ألا يكون source_id == target_id.
+        يُعيد قاموساً بعدد الحركات المنقولة والرصيد النهائي للهدف.
+        """
+        if source_id == target_id:
+            raise ValueError("لا يمكن دمج الحساب مع نفسه — معرّفان متطابقان")
+
+        # جلب حركات المصدر
+        qtx = urllib.parse.urlencode({
+            "customer_id": f"eq.{source_id}",
+            "select": "id",
+        })
+        _, tx_ids = self._req("GET", "transactions", qtx)
+
+        # نقل كل الحركات للهدف (batch update)
+        moved = 0
+        for row in tx_ids:
+            tid = row["id"]
+            upd = urllib.parse.urlencode({"customer_id": target_id})
+            self._req(
+                "PATCH",
+                "transactions",
+                f"id=eq.{tid}",
+                payload={"customer_id": target_id},
+                headers={"Prefer": "return=minimal"},
+            )
+            moved += 1
+
+        # نقل حركات الوقود أيضاً
+        qfuel = urllib.parse.urlencode({
+            "customer_id": f"eq.{source_id}",
+            "select": "id",
+        })
+        try:
+            _, fuel_ids = self._req("GET", "fuel_ledger", qfuel)
+            for row in fuel_ids:
+                fid = row["id"]
+                self._req(
+                    "PATCH",
+                    "fuel_ledger",
+                    f"id=eq.{fid}",
+                    payload={"customer_id": target_id},
+                    headers={"Prefer": "return=minimal"},
+                )
+                moved += 1
+        except RuntimeError:
+            pass  # جدول الوقود قد يكون غير مُهيأ
+
+        # حذف المصدر بعد نقل كل شيء
+        self.delete_customer(source_id, confirm=True)
+
+        new_balance = self.get_balance(target_id)
+        return {"moved": moved, "target_balance": new_balance, "target_id": target_id}
+
+
     # ── النسخ الاحتياطي والاستعادة ──────────────────────────
     def list_all_data(self) -> dict:
         """لقطة كاملة للنسخ الاحتياطي: عملاء + معاملات + قيود المحاسبي."""

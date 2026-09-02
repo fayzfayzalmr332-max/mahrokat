@@ -1,7 +1,7 @@
 name: App Deploy (Vercel)
 
-# نشر البوت الحي إلى Vercel Production — بالتزامن مع خط أنابيب قاعدة البيانات
-# يدوياً: تبويب Actions → App Deploy → Run workflow (زر إعادة النشر/الـ Restart)
+# نشر البوت الحي إلى Vercel Production
+# يدوياً: Actions → App Deploy (Vercel) → Run workflow = زر إعادة النشر/Restart
 
 on:
   push:

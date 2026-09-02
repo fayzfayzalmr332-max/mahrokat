@@ -61,7 +61,6 @@ CALLBACK_MENU_PREFIX = "menu:"
 CALLBACK_ALERT_PREFIX = "alert:"
 CALLBACK_HIST_PREFIX = "hist:"
 CALLBACK_ACC_ADD_PREFIX = "accadd:"
-CALLBACK_ACC_DEL_PREFIX = "accdel:"
 
 # أزرار تصفير البيانات — نظام تأكيد مزدوج بمستويين:
 # 1) reset_no → إلغاء    2) resetmode:soft|full → اختيار نمط التصفير
@@ -220,6 +219,11 @@ def _fmt_dt(iso: object, with_time: bool = True) -> str:
     ampm = "ص" if local.hour < 12 else "م"
     return f"{date} · {h12:02d}:{local.minute:02d} {ampm}"
 
+def _fmt_dt_compact(iso: object) -> str:
+    """تاريخ رقمي مضغوط بلا وقت: «01/09/2026» — مخصص لصفوف الجداول."""
+    return _fmt_dt(iso, with_time=False)
+
+
 
 def _md(text: object) -> str:
     """هروب النصوص الديناميكية (أسماء/ملاحظات) من كسر صيغة Markdown بتليجرام."""
@@ -282,26 +286,6 @@ def _mono_table(header: list[str], rows: list[list[str]]) -> str:
 
 # ── محركات «بطاقة العمليات الكاملة» — مربع نسخ موحد محاذى بالأعمدة ──
 _CARD_BUDGET = 3800  # هامش أمان داخل حد تليجرام 4096 محرفاً
-
-
-def _now_local() -> datetime:
-    """اللحظة الحالية بتوقيت المحطة (لسطر تاريخ الجرد)."""
-    return datetime.now(timezone(timedelta(hours=env_settings.timezone_offset)))
-
-
-def _fmt_dt_compact(iso: object) -> str:
-    """تاريخ مضغوط لصفوف الجداول: dd/mm/yyyy HH:MM بتوقيت المحطة."""
-    if not iso:
-        return "—"
-    try:
-        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-        local = dt.astimezone(timezone(timedelta(hours=env_settings.timezone_offset)))
-    except Exception:  # noqa: BLE001
-        return str(iso)[:16]
-    return (
-        f"{local.day:02d}/{local.month:02d}/{local.year:04d} "
-        f"{local.hour:02d}:{local.minute:02d}"
-    )
 
 
 def _visual_width(s: str) -> int:
@@ -1190,7 +1174,7 @@ async def _show_balance(
                     f"مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
                     f" | بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر",
                 ]
-            meta.append(f"📅 تاريخ الجرد: {_fmt_dt_compact(_now_local())}")
+            meta.append(f"📅 تاريخ الجرد: {_fmt_dt(_local_now().isoformat())}")
             meta.append("حساب اللترات مستقل تماماً عن الرصيد النقدي.")
             try:
                 activity_f = db.get_fuel_activity(
@@ -1230,7 +1214,7 @@ async def _show_balance(
                 f"   مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
                 f" | بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر",
             ]
-        meta.append(f"📅 تاريخ الجرد: {_fmt_dt_compact(_now_local())}")
+        meta.append(f"📅 تاريخ الجرد: {_fmt_dt(_local_now().isoformat())}")
         if ledger:
             meta.append(f"سجل العمليات الكامل ({len(ledger)} عملية) — الأقدم أولاً:")
             rows, footer = _cash_card_rows(ledger)
@@ -1539,16 +1523,9 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not cust:
             await _safe_reply(query.message, "العميل غير موجود.")
             return
-        bal = db.get_balance(cid)
-        act = db.get_activity(cid, limit=5)
-        msg = [f"💳 *{_md(cust['name'])}* — الرصيد: *{_fmt_money(bal)}*"]
-        if act:
-            msg.append("")
-            for r in act:
-                amt = to_decimal(r.get("amount", 0))
-                kind = "دين" if r.get("tx_type") == "debit" else "سداد"
-                msg.append(f"• {kind} {_fmt_money(abs(amt))} — {_fmt_dt(r.get('created_at'), with_time=False)}")
-        await _safe_reply(query.message, "\n".join(msg), parse_mode=ParseMode.MARKDOWN)
+        # ── كشف حساب موحّد (تنسيق احترافي موحّد مع /card) ──
+        found = {"id": cid, "name": cust["name"]}
+        await _reply_card(query.message, found)
         return
 
     # فتح صفة من القائمة الرئيسية
@@ -1872,7 +1849,7 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"💳 الرصيد: {_fmt_money(bal)}",
             f"🔄 عدد الحركات: {_hi_num(count)}",
             f"🕒 آخر نشاط: {_fmt_dt(last) if last else '—'}",
-            f"📅 تاريخ الجرد: {_fmt_dt_compact(_now_local())}",
+            f"📅 تاريخ الجرد: {_fmt_dt(_local_now().isoformat())}",
         ]
         if ledger:
             meta.append(f"سجل العمليات الكامل ({len(ledger)} عملية) — الأقدم أولاً:")
