@@ -175,3 +175,11 @@ supabase/
 `tests` و`db-validate` لا يمسان أي سرّ ولا أي إنتاج — الفشل فيهما = خلل كود/مخطط.
 `db-deploy` وحده يلمس الإنتاج — وفشله = **صفر تغييرات** على قاعدتك (الذرّية محفوظة).
 
+
+---
+
+## 🤖 أتمتة نشر البوت الحي (Vercel) — .github/workflows/app-deploy.yml
+- **مع كل Push إلى master**: pytest ← بناء الإنتاج ← نشر Vercel Production آلياً.
+- **زر Restart يدوي**: تبويب Actions ← App Deploy (Vercel) ← Run workflow.
+- **الأسرار المطلوبة (مرة واحدة)**: VERCEL_TOKEN (Account Settings → Tokens)، VERCEL_ORG_ID وVERCEL_PROJECT_ID (Project → Settings → General) — بنفس أسماء الحروف حرفياً.
+- متغيرات التشغيل (BOT_TOKEN وغيرها) تُقرأ من إعدادات المشروع على Vercel نفسه — لا تُكرر في GitHub.
