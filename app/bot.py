@@ -280,6 +280,169 @@ def _mono_table(header: list[str], rows: list[list[str]]) -> str:
     lines = [fmt(header), sep] + [fmt(r) for r in rows]
     return "```\n" + "\n".join(lines) + "\n```"
 
+# ── محركات «بطاقة العمليات الكاملة» — مربع نسخ موحد محاذى بالأعمدة ──
+_CARD_BUDGET = 3800  # هامش أمان داخل حد تليجرام 4096 محرفاً
+
+
+def _now_local() -> datetime:
+    """اللحظة الحالية بتوقيت المحطة (لسطر تاريخ الجرد)."""
+    return datetime.now(timezone(timedelta(hours=env_settings.timezone_offset)))
+
+
+def _fmt_dt_compact(iso: object) -> str:
+    """تاريخ مضغوط لصفوف الجداول: dd/mm/yyyy HH:MM بتوقيت المحطة."""
+    if not iso:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        local = dt.astimezone(timezone(timedelta(hours=env_settings.timezone_offset)))
+    except Exception:  # noqa: BLE001
+        return str(iso)[:16]
+    return (
+        f"{local.day:02d}/{local.month:02d}/{local.year:04d} "
+        f"{local.hour:02d}:{local.minute:02d}"
+    )
+
+
+def _cell(text: object, width: int, align: str = "l") -> str:
+    """خلية جدول بمسافات ثابتة (l يسار / r يمين للأرقام)."""
+    s = str(text or "")
+    s = s[:width] if len(s) > width else s
+    return s.rjust(width) if align == "r" else s.ljust(width)
+
+
+def _grid(
+    header: list[str], rows: list[list[str]], aligns: list[str]
+) -> list[str]:
+    """جدول نصي بمسافات ثابتة — أسطر جاهزة داخل كتلة الكود الموحدة."""
+    n = len(header)
+    widths = [len(header[i]) for i in range(n)]
+    for r in rows:
+        for i in range(n):
+            cell = r[i] if i < len(r) else ""
+            widths[i] = max(widths[i], min(len(cell), 30))
+    out = [" | ".join(_cell(header[i], widths[i]) for i in range(n))]
+    out.append("-+-".join("-" * widths[i] for i in range(n)))
+    out += [
+        " | ".join(
+            _cell(r[i] if i < len(r) else "", widths[i], aligns[i]) for i in range(n)
+        )
+        for r in rows
+    ]
+    return out
+
+
+def _code_page(lines: list[str]) -> str:
+    """كتلة كود كاملة: تُفتح وتُقفل — النسخ بضغطة واحدة يحمل الرسالة كلها.
+
+    تُعقِّم أي علامة اقتباس خلفية داخل المحتوى حتى لا تكسر سور الكتلة.
+    """
+    safe = [str(ln).replace("`", "ʼ").replace("\\", "﹨") for ln in lines]
+    return "```\n" + "\n".join(safe) + "\n```"
+
+
+def _split_pages(
+    meta: list[str], table: list[str], footer: list[str]
+) -> list[list[str]]:
+    """يضمن عرض «كل» العمليات مهما كان عددها ضمن حد تليجرام (4096).
+
+    يقسّم سجل العمليات إلى صفحات متتالية، كل رسالة كتلة كود كاملة
+    تنتهي بقفل التنسيق، مع تكرار ترويسة الجدول في كل صفحة، وإلحاق
+    الإجماليات بالصفحة الأخيرة فقط.
+    """
+    def sz(lines: list[str]) -> int:
+        return sum(len(x) + 1 for x in lines)
+
+    if not table:
+        return [meta + ([""] + footer if footer else [])]
+    if sz(meta) + sz(table) + sz(footer) + 8 <= _CARD_BUDGET:
+        return [meta + [""] + table + ([""] + footer if footer else [])]
+
+    head, sep, rows = table[0], table[1], table[2:]
+    pages: list[list[str]] = []
+    cur: list[str] = list(meta) + [""]
+    page_no = 1
+    for row in rows:
+        if sz(cur) + len(row) + 1 + 8 > _CARD_BUDGET:
+            pages.append(cur)
+            page_no += 1
+            cur = [f"— تتمة سجل العمليات ({page_no}) —", head, sep]
+        cur.append(row)
+    if footer:
+        if sz(cur) + sz(footer) + 8 > _CARD_BUDGET:
+            pages.append(cur)
+            page_no += 1
+            cur = [f"— تتمة سجل العمليات ({page_no}) —", head, sep]
+        cur += [""] + footer
+    pages.append(cur)
+    return pages
+
+
+def _fmt_money_s(value) -> str:
+    """مبلغ موقَّع ظاهرياً: «+7,000.00» للمقبوضات و«-1,800.00» للمسحوبات."""
+    d = to_decimal(value)
+    return f"{'-' if d < 0 else '+'}{abs(d):,.2f}"
+
+
+def _cash_card_rows(ledger: list[dict]) -> tuple[list[list[str]], list[str]]:
+    """صفوف جدول النقد: التاريخ، النوع، المبلغ الموقَّع، الرصيد بعد كل عملية.
+
+    الرصيد التراكمي يأتي جاهزاً من get_ledger (الأقدم أولاً) — مصدره
+    قاعدة البيانات نفسها فلا مجال لاختلاف حساب العرض عن المحاسبي.
+    """
+    rows: list[list[str]] = []
+    for r in ledger:
+        rows.append(
+            [
+                _fmt_dt_compact(r.get("created_at")),
+                "دين" if r.get("tx_type") == "debit" else "سداد",
+                _fmt_money_s(r.get("amount") or 0),
+                f"{to_decimal(r.get('running_balance') or 0):,.2f}",
+            ]
+        )
+    return rows, []
+
+
+def _fuel_card_rows(activity: list[dict]) -> tuple[list[list[str]], list[str]]:
+    """صفوف جدول اللترات: التاريخ، العملية، اللترات، الرصيد بعد كل عملية.
+
+    يتحمّل قواعد قديمة بلا View رصيد تراكمي: يحسب محلياً بدقة Decimal من
+    liters الموقَّعة (سحب «+» / إيداع «−») مع تصحيح الإشارة من entry_type،
+    ويُلحق الإجماليات بصف footer تُعرض ختام السجل.
+    """
+    rows: list[list[str]] = []
+    running = Decimal("0.000")
+    for r in activity:
+        liters = Decimal(str(r.get("liters") or 0))
+        etype = r.get("entry_type")
+        if etype == "credit" and liters > 0:
+            liters = -liters
+        elif etype == "debit" and liters < 0:
+            liters = abs(liters)
+        running += liters
+        rows.append(
+            [
+                _fmt_dt_compact(r.get("created_at")),
+                "سحب" if liters > 0 else "إيداع",
+                _fmt_liters(liters),
+                _fmt_liters(running),
+            ]
+        )
+    footer = [f"⚖️ صافي اللترات: {_fmt_liters(running)} لتر"] if rows else []
+    return rows, footer
+
+
+async def _reply_card(update: Update, pages: list[list[str]]) -> None:
+    """مرسل البطاقة المُصفَّق: كل صفحة كتلة كود مكتملة القفل (نسخ بضغطة واحدة).
+
+    الرسالة الأولى تفتح بالبيانات الأساسية ثم الجدول، واللاحقات تتمة السجل
+    بترويسته المتكررة — والأخيرة تحمل الإجماليات (قرار _split_pages مسبقاً).
+    """
+    for page in pages:
+        await update.effective_message.reply_text(
+            _code_page(page), parse_mode=ParseMode.MARKDOWN_V2
+        )
+
 
 _MD_SPECIALS = str.maketrans({c: "\\" + c for c in "\\*_`[~"})
 # أحرف MarkdownV2 التي يجب حجزها في النص الخارجي (خارج كتل الكود)
@@ -924,6 +1087,8 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return STATE_PENDING_CONFIRM
     context.user_data.pop("pending_tx", None)
     return ConversationHandler.END
+
+
 async def _show_balance(
     update: Update,
     name: str,
@@ -970,73 +1135,69 @@ async def _show_balance(
             if fuel_type and fuel_type in fuel_balances:
                 only = fuel_balances[fuel_type]
                 f_label = "مازوت" if fuel_type == "mazot" else "بنزين"
-                lines = [
-                    f"⛽ *رصيد {f_label} للعميل* — {_md(cust['name'])}",
-                    "━━━━━━━━━━━━━━━━━━━━",
-                    f"• {f_label}: *{_fmt_liters(only)} لتر*",
+                meta = [
+                    f"⛽ رصيد {f_label} للعميل — {cust['name']}",
+                    f"{f_label}: {_fmt_liters(only)} لتر",
                 ]
             else:
-                lines = [
-                    f"⛽ *كشف لترات العميل* — {_md(cust['name'])}",
-                    "━━━━━━━━━━━━━━━━━━━━",
-                    f"• مازوت: *{_fmt_liters(fuel_balances['mazot'])} لتر*",
-                    f"• بنزين: *{_fmt_liters(fuel_balances['benzine'])} لتر*",
+                meta = [
+                    f"⛽ كشف لترات العميل — {cust['name']}",
+                    f"مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
+                    f" | بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر",
                 ]
-            lines += ["", "_حساب اللترات مستقل تماماً عن الرصيد النقدي._"]
+            meta.append(f"📅 تاريخ الجرد: {_fmt_dt_compact(_now_local())}")
+            meta.append("حساب اللترات مستقل تماماً عن الرصيد النقدي.")
             try:
                 activity_f = db.get_fuel_activity(
-                    cust["id"], fuel_type=fuel_type, limit=5
+                    cust["id"], fuel_type=fuel_type, limit=10000
                 )
             except Exception:  # noqa: BLE001
                 activity_f = []
             if activity_f:
-                lines += ["", f"📋 *آخر حركات الوقود ({_hi_num(len(activity_f))}):*"]
-                for i, r in enumerate(activity_f, start=1):
-                    lit = _fmt_liters(r.get("liters", 0))
-                    icon = "🔺" if r.get("entry_type") == "debit" else "🔻"
-                    kind = "سحب" if r.get("entry_type") == "debit" else "إيداع"
-                    f_lbl = "مازوت" if r.get("fuel_type") == "mazot" else "بنزين"
-                    lines.append(
-                        f"• {_hi_num(i)}) {icon} {kind} {lit} لتر ({f_lbl})\n"
-                        f"    🕓 {_fmt_dt(r.get('created_at'))}"
-                    )
-            await update.effective_message.reply_text(
-                "\n".join(lines), parse_mode=ParseMode.MARKDOWN
-            )
+                meta.append(
+                    f"سجل العمليات الكامل ({len(activity_f)} عملية) — الأقدم أولاً:"
+                )
+                rows, footer = _fuel_card_rows(activity_f)
+                table = _grid(
+                    ["التاريخ", "العملية", "اللترات", "الرصيد"],
+                    rows, ["l", "l", "r", "r"],
+                )
+            else:
+                table, footer = [], []
+                meta += ["", "— لا توجد حركات لترات مفصلة لعرضها بعد."]
+            await _reply_card(update, _split_pages(meta, table, footer))
             return
 
-        # ── الكشف المتكامل: النقد ثم اللترات ثم الحركات ──
+        # ── البطاقة الموحّدة: مربع نسخ واحد (البيانات + سجل العمليات الكامل) ──
         balance = db.get_balance(cust["id"])
-        activity = db.get_activity(cust["id"], limit=5)
+        try:
+            ledger = db.get_ledger(cust["id"])  # الكامل: الأقدم أولاً + رصيد تراكمي
+        except Exception:  # noqa: BLE001
+            ledger = []
 
-        lines = [
-            f"💳 *بطاقة العميل* — {_md(cust['name'])}",
-            "━━━━━━━━━━━━━━━━━━━━",
-            f"💰 الرصيد النقدي: *{_fmt_money(balance)}*",
+        meta = [
+            f"💳 بطاقة العميل — {cust['name']}",
+            f"💰 الرصيد النقدي: {_fmt_money(balance)}",
         ]
         if has_fuel:
-            lines += [
-                "⛽ *رصيد اللترات (حساب مستقل عن النقد):*",
-                f"   • مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر",
-                f"   • بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر",
+            meta += [
+                "⛽ رصيد اللترات (حساب مستقل عن النقد):",
+                f"   مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
+                f" | بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر",
             ]
-        if activity:
-            lines += ["", f"📋 *آخر الحركات النقدية ({_hi_num(len(activity))}):*"]
-            for i, r in enumerate(activity, start=1):
-                amt = abs(to_decimal(r.get("amount", 0)))
-                kind = "دين" if r.get("tx_type") == "debit" else "سداد"
-                icon = "🔺" if kind == "دين" else "🔻"
-                note = r.get("note")
-                note_s = f" · {_md(str(note))}" if note else ""
-                lines.append(
-                    f"• {_hi_num(i)}) {icon} {kind} {_fmt_money(amt)}{note_s}\n"
-                    f"    🕓 {_fmt_dt(r.get('created_at'))}"
-                )
+        meta.append(f"📅 تاريخ الجرد: {_fmt_dt_compact(_now_local())}")
+        if ledger:
+            meta.append(f"سجل العمليات الكامل ({len(ledger)} عملية) — الأقدم أولاً:")
+            rows, footer = _cash_card_rows(ledger)
+            footer.append(f"⚖️ الرصيد الصافي: {_fmt_money(balance)}")
+            table = _grid(
+                ["التاريخ", "النوع", "المبلغ", "الرصيد"],
+                rows, ["l", "l", "r", "r"],
+            )
         else:
-            lines += ["", "— لا توجد حركات نقدية مسجلة لهذا العميل بعد."]
-        await update.effective_message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
-        )
+            table, footer = [], []
+            meta += ["", "— لا توجد حركات نقدية مسجلة لهذا العميل بعد."]
+        await _reply_card(update, _split_pages(meta, table, footer))
     except Exception:  # noqa: BLE001
         logger.exception("فشل عرض الرصيد")
         await update.effective_message.reply_text("خطأ في جلب الرصيد. حاول مجدداً.")
@@ -1604,7 +1765,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """بطاقة عميل كاملة: الرصيد، العمر الدفترى، آخر نشاط، آخر 5 حركات."""
+    """بطاقة عميل كاملة: الرصيد، آخر نشاط، وسجل العمليات الكامل محاذاً."""
     if not is_authorized(update):
         await _guard(update)
         return ConversationHandler.END
@@ -1627,29 +1788,29 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         bal = info["balance"]
         last = info.get("last_activity_at")
         count = info["txn_count"]
-        table = _mono_table(
-            ["البند", "القيمة"],
-            [
-                ["💳 الرصيد", _fmt_money(bal)],
-                ["🔄 عدد الحركات", _hi_num(count)],
-                ["🕒 آخر نشاط", _fmt_dt(last) if last else "—"],
-            ],
-        )
-        msg_lines = [f"🪪 *بطاقة العميل* — {_md2(c['name'])}", table, ""]
-        if info["recent"]:
-            msg_lines.append("*آخر 5 حركات:*")
-            for r in info["recent"]:
-                amt = to_decimal(r.get("amount", 0))
-                kind = "دين" if r.get("tx_type") == "debit" else "سداد"
-                raw_note = r.get("note")
-                note = f" · {_md2(raw_note)}" if raw_note else ""
-                msg_lines.append(
-                    f"• {kind} {_fmt_money_md2(abs(amt))}{note} "
-                    f"— {_md2(_fmt_dt(r.get('created_at')))}"
-                )
-        await update.effective_message.reply_text(
-            "\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN_V2
-        )
+        try:
+            ledger = db.get_ledger(found["id"])  # الكامل: الأقدم أولاً + رصيد تراكمي
+        except Exception:  # noqa: BLE001
+            ledger = []
+        meta = [
+            f"🪪 بطاقة العميل — {c['name']}",
+            f"💳 الرصيد: {_fmt_money(bal)}",
+            f"🔄 عدد الحركات: {_hi_num(count)}",
+            f"🕒 آخر نشاط: {_fmt_dt(last) if last else '—'}",
+            f"📅 تاريخ الجرد: {_fmt_dt_compact(_now_local())}",
+        ]
+        if ledger:
+            meta.append(f"سجل العمليات الكامل ({len(ledger)} عملية) — الأقدم أولاً:")
+            rows, footer = _cash_card_rows(ledger)
+            footer.append(f"⚖️ الرصيد الصافي: {_fmt_money(bal)}")
+            table = _grid(
+                ["التاريخ", "النوع", "المبلغ", "الرصيد"],
+                rows, ["l", "l", "r", "r"],
+            )
+        else:
+            table, footer = [], []
+            meta += ["", "— لا توجد حركات نقدية مسجلة لهذا العميل بعد."]
+        await _reply_card(update, _split_pages(meta, table, footer))
     except ValueError:
         await update.effective_message.reply_text(f"لا يوجد عميل باسم «{name}».")
     except Exception as exc:  # noqa: BLE001
