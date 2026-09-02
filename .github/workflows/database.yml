@@ -102,8 +102,28 @@ jobs:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
           SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
 
+      - name: فحص مسبق لكلمة مرور قاعدة البيانات (تنظيف الحواف + حارس الفراغ)
+        run: |
+          if [ -z "${SUPABASE_DB_PASSWORD}" ]; then
+            echo "::error::السرّ SUPABASE_DB_PASSWORD فارغ أو غير معرّف — أضفه من Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          TRIMMED="$(printf '%s' "${SUPABASE_DB_PASSWORD}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ -z "$TRIMMED" ]; then
+            echo "::error::كلمة المرور مسافات فقط — أعد إدخال كلمة مرور قاعدة البيانات الفعلية"
+            exit 1
+          fi
+          echo "تم التنظيف — طول كلمة المرور: ${#TRIMMED} حرفاً (القيمة نفسها لا تُعرض أبداً)"
+          echo "SUPABASE_DB_PASSWORD=$TRIMMED" >> "$GITHUB_ENV"
+
       - name: دفع الترحيلات
         run: supabase db push --include-all
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+
+      - name: تلميح التشخيص عند فشل النشر
+        if: failure()
+        run: |
+          echo "خطأ 28P01 (password authentication failed) = كلمة المرور مرفوضة من الخادم."
+          echo "الإصلاح: Supabase → Project Settings → Database → Reset database password ← انسخ الجديدة"
+          echo "ثم GitHub → Settings → Secrets → Actions → حدّث SUPABASE_DB_PASSWORD ← وأعد تشغيل الوظيفة الفاشلة فقط."
