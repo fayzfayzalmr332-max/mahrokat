@@ -31,7 +31,11 @@ begin
                          'fn_recalc_last_activity', 'fn_audit_log',
                          'fn_customer_balance');
 
-    select count(*) into v_settings from public.app_settings;
+    -- مفاتيح الأساس الأربعة (البوت يضيف صفوفاً ديناميكية بلا حدود معلومة:
+    -- حالة المحادثات تُخزَّن كـ JSON في app_settings — انظر app/persistence.py)
+    select count(*) into v_settings from public.app_settings
+     where key in ('inactive_days', 'weekly_alert_enabled',
+                   'weekly_alert_weekday', 'weekly_alert_time');
 
     if v_tables <> 6 then
         raise exception 'SCHEMA MISMATCH: tables=% (المتوقع 6)', v_tables;
@@ -43,7 +47,7 @@ begin
         raise exception 'SCHEMA MISMATCH: functions=% (المتوقع 5)', v_fns;
     end if;
     if v_settings <> 4 then
-        raise exception 'SCHEMA MISMATCH: app_settings rows=% (المتوقع 4)', v_settings;
+        raise exception 'SCHEMA MISMATCH: app_settings canonical keys=% (المتوقع 4: inactive_days, weekly_alert_enabled, weekly_alert_weekday, weekly_alert_time)', v_settings;
     end if;
 
     raise notice 'SCHEMA OK: 6 tables, 6 views, 5 functions, 4 settings ✔';
