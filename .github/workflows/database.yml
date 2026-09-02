@@ -103,6 +103,8 @@ jobs:
           SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
 
       - name: فحص مسبق لكلمة مرور قاعدة البيانات (تنظيف الحواف + حارس الفراغ)
+        env:
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
           if [ -z "${SUPABASE_DB_PASSWORD}" ]; then
             echo "::error::السرّ SUPABASE_DB_PASSWORD فارغ أو غير معرّف — أضفه من Settings → Secrets and variables → Actions"
