@@ -463,7 +463,7 @@ begin
     end if;
 
     insert into public.audit_log (table_name, operation, record_id, old_data, new_data, done_by)
-    values (tg_table_name, tg_op, v_id, v_old, v_new, session_user()::text);
+    values (tg_table_name, tg_op, v_id, v_old, v_new, session_user::text);
 
     return coalesce(new, old);
 end;
