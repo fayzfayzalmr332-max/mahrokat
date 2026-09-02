@@ -32,6 +32,11 @@ DECIMAL_PLACES = Decimal("0.01")
 # معرّف UUID مستحيل عملياً — يُستخدم كفلتر حذف شامل في PostgREST
 _NULL_UUID = "00000000-0000-0000-0000-000000000000"
 
+# نافذة حارس منع التكرار (بالدقائق) — تُستخدم أيضاً لبناء مفتاح Idempotency
+# ذرّي على مستوى قاعدة البيانات (external_ref) لمنع أي تسجيل مزدوج حتى عند
+# ضغطتين متزامنتين في نفس الثانية (Race Condition).
+DEDUP_WINDOW_MINUTES = 5
+
 
 def to_decimal(value: object) -> Decimal:
     """تحويل آمن لأي قيمة إلى Decimal بحسم إلى منزلتين عشريتين (15,2)."""
@@ -43,20 +48,56 @@ def to_decimal(value: object) -> Decimal:
         dec = Decimal(str(value))
     elif isinstance(value, str):
         try:
-            dec = Decimal(value.replace(",", ".").strip())
+            # دعم الفواصل الغربية والعربية («٫») — تحصين تدقيق للمدخلات
+            dec = Decimal(value.replace(",", ".").replace("٫", ".").strip())
         except InvalidOperation as exc:
             raise ValueError(f"قيمة نقدية غير صالحة: {value!r}") from exc
     else:
         raise ValueError(f"نوع غير مدعوم للمبلغ: {type(value).__name__}")
 
-    dec = dec.quantize(DECIMAL_PLACES, rounding=ROUND_HALF_UP)
+    # تحصين تدقيق: فحص المحدودية قبل quantize — لأن quantize على Infinity
+    # يرفع InvalidOperation غير موحّد، وNaN تجتاز كل مقارنات الحجم (كل مقارنة
+    # معها False). نرفضهما صراحةً بقيمة واضحة قبل الحسم.
+    if not dec.is_finite():
+        raise ValueError("قيمة نقدية غير محدودة (NaN/Infinity) مرفوضة")
+    try:
+        dec = dec.quantize(DECIMAL_PLACES, rounding=ROUND_HALF_UP)
+    except InvalidOperation as exc:
+        raise ValueError(f"قيمة نقدية غير قابلة للحسم: {value!r}") from exc
     if abs(dec) > MAX_MONEY:
         raise ValueError("المبلغ يتجاوز الحد المسموح DECIMAL(15,2)")
     return dec
 
 
 def now_utc() -> str:
+    """الطابع الزمني اللحظي الحالي (UTC+ISO) — يُلتقط وقت الاستدعاء مباشرة.
+
+    لا يوجد أي تخزين أو تجميد: كل طلب يسجّل created_at لحظة الإدراج
+    بنفس ساعة النظام (توقيت UTC موحّد)، ويُحوَّل للتنسيق المحلي عند
+    العرض فقط عبر TIMEZONE_OFFSET.
+    """
     return datetime.now(timezone.utc).isoformat()
+
+
+def _idempotency_ref(
+    customer_id: str,
+    tx_type: str,
+    amount: object,
+    minutes: int = DEDUP_WINDOW_MINUTES,
+) -> str:
+    """مفتاح تفرّد ذرّي لعملية مالية — يحمي الإدراج نفسه من التكرار.
+
+    يُشتق حتماً من (العميل + النوع + المبلغ الموقَّع + نافذة الزمن)، فأي
+    إعادة محاولة (ضغط مزدوج، أو طلب متزامن في نفس الثانية، أو إعادة توجيه
+    بعد فشل مؤقت وصل فيه الطلب للقاعدة) تُنتج نفس المفتاح، فيتعثّر في قيد
+    UNIQUE(external_ref) الموجود في الترحيل 003 ويُرفض مرّة واحدة فقط.
+    """
+    dec = to_decimal(amount)
+    if tx_type not in ("debit", "credit"):
+        raise ValueError(f"نوع معاملة غير معروف: {tx_type}")
+    signed = dec if tx_type == "debit" else -dec
+    bucket = int(time.time() // (minutes * 60))
+    return f"auto:{customer_id}:{tx_type}:{signed}:{bucket}"
 
 
 def _embedded_name(embedded) -> str:
@@ -232,8 +273,16 @@ class Database:
         amount: Decimal,
         tx_type: str,  # 'debit' | 'credit'
         note: str | None = None,
+        external_ref: str | None = None,
     ) -> dict:
-        """تسجّل حركة مالية واحدة بالمبلغ موجب والاتجاه في tx_type."""
+        """تسجّل حركة مالية واحدة بالمبلغ موجب والاتجاه في tx_type.
+
+        عند تمرير external_ref يُنفَّذ الإدراج كـ upsert ذرّي على قيد
+        UNIQUE(external_ref): أي إعادة محاولة لنفس العملية (نفس المفتاح)
+        تُتجاهل من قاعدة البيانات نفسها فلا يُسجَّل أبداً تكرار — حتى لو
+        اجتاز الطلبان حارس قبل-الإدراج في نفس الثانية (Race Condition).
+        في القواعد القديمة (بلا عمود) يسقط الترقية آلياً ويعمل كالسابق.
+        """
         dec = to_decimal(amount)
         if dec <= 0:
             raise ValueError("مبلغ المعاملة يجب أن يكون موجباً")
@@ -246,10 +295,56 @@ class Database:
             "amount": str(signed),  # نص دقيق يصلح لـ numeric(15,2)
             "tx_type": tx_type,
             "note": note,
-            "created_at": now_utc(),
+            "created_at": now_utc(),  # طابع لحظي وقت الإدراج (بلا تجميد)
         }
-        _, rows = self._req("POST", "transactions", "select=id,amount,tx_type,note,created_at", payload)
+
+        # ── مسار الإدراج الذرّي (يمنع التكرار من قاعدة البيانات ذاتها) ──
+        if external_ref and not getattr(self, "_drop_external_ref", False):
+            payload["external_ref"] = external_ref
+            query = urllib.parse.urlencode(
+                {
+                    "on_conflict": "external_ref",
+                    "select": "id,amount,tx_type,note,created_at",
+                }
+            )
+            headers = {"Prefer": "resolution=ignore-duplicates,return=representation"}
+            try:
+                _, rows = self._req(
+                    "POST", "transactions", query, payload, headers=headers
+                )
+            except RuntimeError as exc:  # قاعدة قديمة بلا عمود/قيد external_ref
+                if any(
+                    token in str(exc).lower()
+                    for token in ("external_ref", "constraint", "column", "404", "not found")
+                ):
+                    self._drop_external_ref = True  # لا نكرر الفشل في الطلبات التالية
+                    logger.warning(
+                        "قاعدة بلا external_ref — إدراج بدون مفتاح التفرّد: %s", exc
+                    )
+                    payload.pop("external_ref", None)
+                    _, rows = self._req(
+                        "POST",
+                        "transactions",
+                        "select=id,amount,tx_type,note,created_at",
+                        payload,
+                    )
+                else:
+                    raise
+        else:
+            _, rows = self._req(
+                "POST", "transactions", "select=id,amount,tx_type,note,created_at", payload
+            )
+
         if not rows:
+            # مع upsert التفرّد: صفوف فارغة = عملية مكررة أُهملت من قاعدة
+            # البيانات (Race) — نعيد الصف الموجود كسلوك Idempotent حتى لا
+            # يُعرض كفشل، ومن دون تكرار التسجيل إطلاقاً.
+            if external_ref:
+                existing = self.find_recent_transaction(
+                    customer_id, dec, tx_type, minutes=DEDUP_WINDOW_MINUTES
+                )
+                if existing:
+                    return existing
             raise RuntimeError("فشل تسجيل المعاملة")
         # تُلمس آخر نشاط للعميل لأغراض التنبيه الأسبوعي بغير النشطين
         try:
@@ -327,12 +422,17 @@ class Database:
         return to_decimal(rows[0]["balance"]) if rows else Decimal("0.00")
 
     def get_activity(self, customer_id: str, limit: int = 10) -> list[dict]:
-        """آخر الحركات للعميل (الأحدث أولاً)."""
+        """آخر الحركات للعميل (الأحدث أولاً) — بترتيب قطعي حاسم.
+
+        الترتيب الثانوي `id.desc` يضمن ترتيباً ثابتاً وحاسماً حتى عند تسجيل
+        عمليتين في نفس الطابع الزمني بالضبط (نفس الثانية) فلا تتناوب النتائج
+        بين الاستدعاءات، ويبقى «آخر عملية» في /undo موثوقاً.
+        """
         q = urllib.parse.urlencode(
             {
                 "customer_id": f"eq.{customer_id}",
                 "select": "id,amount::text,tx_type,note,created_at",
-                "order": "created_at.desc",
+                "order": "created_at.desc,id.desc",
                 "limit": str(limit),
             }
         )
@@ -372,6 +472,10 @@ class Database:
                 c["status"] = (
                     "debtor" if bal > 0 else ("creditor" if bal < 0 else "settled")
                 )
+            # إصلاح تدقيق: المسار القديم كان يعيد كل العملاء حتى عند طلب
+            # المدينين فقط → فيفسد إجمالي الدين في /debts و /top.
+            if only_debtors:
+                rows = [c for c in rows if c["status"] == "debtor"]
         for c in rows:
             c["balance"] = to_decimal(c.get("balance") or 0)
         if not only_debtors:
@@ -556,13 +660,15 @@ class Database:
         total = sum((c["balance"] for c in debtors), Decimal("0.00"))
         return debtors, total
 
-    def today_summary(self, offset_hours: int = 0) -> dict:
+    def today_summary(self, offset_hours: int | None = None) -> dict:
         """تقرير اليوم بتوقيت منطقة تشغيل المحطة.
 
         بداية اليوم تُحسب من TIMEZONE_OFFSET (لم تعد تعتمد على ساعة
         الخادم)، وأسماء العملاء تأتي مضمّنة في نفس الطلب (تضمين PostgREST)
-        بدل طلب إضافي.
+        بدل طلب إضافي. الترتيب قطعي حتى لعمليتين في نفس الثانية.
         """
+        if offset_hours is None:
+            offset_hours = settings.timezone_offset  # إصلاح: لا UTC افتراضياً
         now_utc_dt = datetime.now(timezone.utc)
         now_local = now_utc_dt + timedelta(hours=offset_hours)
         start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -571,7 +677,7 @@ class Database:
             {
                 "created_at": f"gte.{start_utc}",
                 "select": "customer_id,amount::text,tx_type,created_at,customers(name)",
-                "order": "created_at.desc",
+                "order": "created_at.desc,id.desc",
             }
         )
         _, rows = self._req("GET", "transactions", q)
@@ -599,7 +705,7 @@ class Database:
             {
                 "tx_type": "eq.credit",
                 "select": "customer_id,amount::text,created_at,note,customers(name)",
-                "order": "created_at.desc",
+                "order": "created_at.desc,id.desc",
                 "limit": str(limit),
             }
         )
@@ -645,6 +751,307 @@ class Database:
         """آخر معاملة للعميل (مع المعرف — للتراجع)."""
         act = self.get_activity(customer_id, limit=1)
         return act[0] if act else None
+
+    def get_ledger(self, customer_id: str, limit: int | None = None) -> list[dict]:
+        """دفتر الأستاذ (كشف حساب جارٍ): حركات العميل تسلسلياً من الأقدم
+        للأحدث، مع الرصيد التراكمي بعد كل حركة (Running Balance).
+
+        - التسلسل زمني حاسم: (created_at, id) تصاعدياً — فلا تداخل أرصدة
+          ولا قلبٌ حسابي حتى لعمليتين في نفس الثانية.
+        - الرصيد التراكمي يُحسب بعد كل حركة بدقة Decimal عالية (منزلتان).
+        - يُفضَّل view RPC `v_customer_ledger` (الترحيل 005) ويقع في حساب
+          محلي مطابق عند غيابه.
+        """
+        params = [
+            f"customer_id=eq.{customer_id}",
+            "select=customer_id,id,amount::text,tx_type,note,created_at,running_balance::text",
+            "order=created_at.asc,id.asc",
+        ]
+        if limit and limit > 0:
+            params.append(f"limit={limit}")
+        try:
+            _, rows = self._req("GET", "v_customer_ledger", "&".join(params))
+            ledger: list[dict] = []
+            for r in rows:
+                item = dict(r)
+                item["amount"] = to_decimal(item.get("amount") or 0)
+                item["running_balance"] = to_decimal(item.get("running_balance") or 0)
+                ledger.append(item)
+            return ledger
+        except RuntimeError:  # noqa: BLE001
+            pass
+
+        # مسار بديل: حساب محلي قطعي (الأقدم أولاً) — يحافظ على نفس المعنى.
+        newest_first = self.get_activity(customer_id, limit=10_000)
+        ordered = sorted(
+            newest_first,
+            key=lambda r: (str(r.get("created_at", "")), str(r.get("id", ""))),
+        )
+        ledger = []
+        running = Decimal("0.00")
+        for r in ordered:
+            amt = to_decimal(r.get("amount") or 0)
+            running += amt
+            item = dict(r)
+            item["amount"] = amt
+            item["running_balance"] = running
+            ledger.append(item)
+        if limit and limit > 0:
+            ledger = ledger[-limit:]  # آخر limit حركة برصيدها التراكمي الحقيقي
+        return ledger
+
+# ── حسابات الوقود باللترات (مستقلة تماماً عن النقد) ────────
+    FUEL_DECIMAL_PLACES = Decimal("0.001")  # 3 منازل عشرية (أجزاء اللتر)
+    FUEL_MAX = Decimal("9999999999999.999")  # numeric(15,3)
+
+    def _to_liters(
+        self,
+        value: object,
+        field: str = "اللترات",
+    ) -> Decimal:
+        """تحويل آمن لقيمة اللترات إلى Decimal ثلاثي المنازل (15,3).
+
+        يقبل المدخلات النصية والرقمية، يرفض NaN/Infinity والمبالغ فوق الحد،
+        ويحوّل الفواصل الغربية والعربية على السواء.
+        """
+        try:
+            if isinstance(value, Decimal):
+                dec = value
+            elif isinstance(value, int):
+                dec = Decimal(value)
+            elif isinstance(value, float):
+                dec = Decimal(str(value))
+            elif isinstance(value, str):
+                dec = Decimal(
+                    value.replace(",", ".").replace("٫", ".").strip()
+                )
+            else:
+                raise TypeError(f"نوع غير مدعوم لل{field}: {type(value).__name__}")
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"قيمة {field} غير صالحة: {value!r}") from exc
+
+        if not dec.is_finite():
+            raise ValueError(f"قيمة {field} غير محدودة (NaN/Infinity) مرفوضة")
+        dec = dec.quantize(self.FUEL_DECIMAL_PLACES, rounding=ROUND_HALF_UP)
+        if abs(dec) > self.FUEL_MAX:
+            raise ValueError(f"قيمة {field} تتجاوز الحد المسموح")
+        return dec
+
+    def add_fuel_entry(
+        self,
+        customer_id: str,
+        liters: Decimal,
+        fuel_type: str,  # 'mazot' | 'benzine'
+        entry_type: str,  # 'debit' (سحب/دين+) | 'credit' (إيداع/سداد−)
+        note: str | None = None,
+        external_ref: str | None = None,
+    ) -> dict:
+        """تسجيل حركة لترات وقود في دفتر مستقل — لا يلمس رصيد النقد أبداً.
+
+        - يُخزَّن المقدار موجباً والاتجاه في entry_type (كمشروع النقد).
+        - عند external_ref يُنفَّذ upsert ذرّي على UNIQUE(external_ref) لضربة
+          مزدوجة/إعادة محاولة لا تُسجَّل مرتين أبداً.
+        - لمسة آخر نشاط للعميل تُحفظ للأغراض نفسها التي في النقد.
+        """
+        dec = self._to_liters(liters, "اللترات")
+        if dec <= 0:
+            raise ValueError("قيمة اللترات يجب أن تكون موجبة")
+        if fuel_type not in ("mazot", "benzine"):
+            raise ValueError(f"نوع وقود غير معروف: {fuel_type}")
+        if entry_type not in ("debit", "credit"):
+            raise ValueError(f"نوع حركة وقود غير معروف: {entry_type}")
+
+        signed = dec if entry_type == "debit" else -dec
+        payload = {
+            "customer_id": customer_id,
+            "fuel_type": fuel_type,
+            "liters": str(signed),  # نص دقيق يصلح لـ numeric(15,3)
+            "entry_type": entry_type,
+            "note": (note or "").strip()[:500] or None,
+            "created_at": now_utc(),
+        }
+        if external_ref:
+            payload["external_ref"] = external_ref
+
+        query = (
+            urllib.parse.urlencode(
+                {
+                    "on_conflict": "external_ref",
+                    "select": (
+                        "id,customer_id,fuel_type,liters::text,entry_type,note,created_at"
+                    ),
+                }
+            )
+            if external_ref
+            else "select=id,customer_id,fuel_type,liters::text,entry_type,note,created_at"
+        )
+        headers = (
+            {"Prefer": "resolution=ignore-duplicates,return=representation"}
+            if external_ref
+            else None
+        )
+        try:
+            _, rows = self._req("POST", "fuel_ledger", query, payload, headers=headers)
+        except RuntimeError as exc:  # قاعدة قديمة بلا جدول → فشل صريح
+            if any(
+                token in str(exc).lower()
+                for token in (
+                    "fuel_ledger",
+                    "external_ref",
+                    "constraint",
+                    "column",
+                    "404",
+                    "not found",
+                )
+            ):
+                raise RuntimeError(
+                    "جدول fuel_ledger غير موجود في قاعدة البيانات — "
+                    "شغّل الترحيل 006_fuel_liters.sql"
+                ) from exc
+            raise
+        if not rows:
+            # upsert تجاهل العملية المكررة (Race) → سلوك Idempotent
+            existing = self.get_fuel_activity(
+                customer_id, fuel_type=fuel_type, limit=1
+            )
+            if existing and abs(to_decimal(existing[0].get("liters") or 0)) == abs(dec):
+                return existing[0]
+            raise RuntimeError("فشل تسجيل حركة الوقود")
+
+        try:
+            self._touch_customer(customer_id)
+        except RuntimeError:  # noqa: BLE001
+            logger.warning("تعذّر تحديث آخر نشاط لعميل الوقود %s", customer_id)
+        logger.info(
+            "حركة وقود %s (%s) بقيمة %s لتر للعميل %s",
+            entry_type,
+            fuel_type,
+            signed,
+            customer_id,
+        )
+        return rows[0]
+
+    def get_fuel_balance(
+        self,
+        customer_id: str,
+        fuel_type: str | None = None,
+    ) -> Decimal:
+        """رصيد لترات وقود العميل — عبر جمع الطلبات الحية (لا View قديمة).
+
+        fuel_type=None يعيد صافي كل أنواع الوقود (مازوت + بنزين) لكن منفصلاً
+        عن النقد قطعاً. الأرصدة باللترات وبالدقة الكاملة (3 منازل).
+        """
+        total = Decimal("0.000")
+        params = {
+            "customer_id": f"eq.{customer_id}",
+            "select": "liters::text",
+        }
+        if fuel_type:
+            params["fuel_type"] = f"eq.{fuel_type}"
+        q = urllib.parse.urlencode(params)
+        try:
+            _, rows = self._req("GET", "fuel_ledger", q)
+        except RuntimeError as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "جدول fuel_ledger غير موجود — شغّل الترحيل 006"
+            ) from exc
+        for r in rows:
+            total += self._to_liters(r.get("liters") or 0)
+        return total
+
+    def get_fuel_activity(
+        self,
+        customer_id: str,
+        fuel_type: str | None = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        """آخر حركات الوقود للعميل (الأحدث أولاً) بترتيب حاسم.
+
+        الترتيب `created_at.desc,id.desc` يضمن ثبات النتائج حتى لنفس الثانية.
+        """
+        params = {
+            "customer_id": f"eq.{customer_id}",
+            "select": "id,fuel_type,liters::text,entry_type,note,created_at",
+            "order": "created_at.desc,id.desc",
+            "limit": str(limit),
+        }
+        if fuel_type:
+            params["fuel_type"] = f"eq.{fuel_type}"
+        q = urllib.parse.urlencode(params)
+        _, rows = self._req("GET", "fuel_ledger", q)
+        return rows or []
+
+    def get_fuel_balances_all(self) -> dict:
+        """أرصدة وقود كل العملاء عبر View — طلب واحد.
+
+        تُستخدم في كشف الحساب المتكامل وفي لوحة /stats عند الحاجة.
+        تُسقط الصفوف صفرية الوقود حتى لا تُزحم العرض.
+        """
+        q = urllib.parse.urlencode(
+            {"select": "id,name,mazot_balance::text,benzine_balance::text,fuel_txn_count"}
+        )
+        try:
+            _, rows = self._req("GET", "v_fuel_balances", q)
+        except RuntimeError:  # noqa: BLE001
+            return {}
+        out: dict[str, dict] = {}
+        for r in rows:
+            m = self._to_liters(r.get("mazot_balance") or 0)
+            b = self._to_liters(r.get("benzine_balance") or 0)
+            if m == 0 and b == 0:
+                continue
+            out[r["id"]] = {
+                "mazot_balance": m,
+                "benzine_balance": b,
+                "fuel_txn_count": int(r.get("fuel_txn_count") or 0),
+            }
+        return out
+
+    def delete_fuel_entry(self, entry_id: str) -> None:
+        """حذف حركة وقود بمعرّفها (يُستخدم للتراجع)."""
+        q = urllib.parse.urlencode({"id": f"eq.{entry_id}"})
+        self._req("DELETE", "fuel_ledger", q)
+
+    def get_fuel_entry(self, entry_id: str) -> dict | None:
+        """إحضار حركة وقود بمعرّفها (يُستخدم للتراجع وإعادة العرض)."""
+        q = urllib.parse.urlencode(
+            {
+                "id": f"eq.{entry_id}",
+                "select": "id,customer_id,fuel_type,liters::text,entry_type,note,created_at",
+                "limit": "1",
+            }
+        )
+        _, rows = self._req("GET", "fuel_ledger", q)
+        return rows[0] if rows else None
+
+    def find_recent_fuel_entry(
+        self,
+        customer_id: str,
+        fuel_type: str,
+        liters: Decimal,
+        entry_type: str,
+        minutes: int = 5,
+    ) -> dict | None:
+        """حارس منع تكرار حركة الوقود (نفس العميل+النوع+المقدار+الاتجاه)."""
+        try:
+            dec = self._to_liters(liters)
+            since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+            q = urllib.parse.urlencode(
+                {
+                    "customer_id": f"eq.{customer_id}",
+                    "fuel_type": f"eq.{fuel_type}",
+                    "liters": f"eq.{dec}",
+                    "entry_type": f"eq.{entry_type}",
+                    "created_at": f"gte.{since}",
+                    "select": "id",
+                    "limit": "1",
+                }
+            )
+            _, rows = self._req("GET", "fuel_ledger", q)
+            return rows[0] if rows else None
+        except RuntimeError:  # noqa: BLE001
+            logger.warning("فشل فحص تكرار الوقود: %s", customer_id)
+            return None
 
     # ── المحاسبي الشخصي (صندوق المالك) ────────────────────────
 
@@ -748,7 +1155,7 @@ class Database:
         q = urllib.parse.urlencode(
             {
                 "select": "id,entry_type,amount::text,note,category,created_at",
-                "order": "created_at.desc",
+                "order": "created_at.desc,id.desc",
                 "limit": str(limit),
             }
         )
@@ -761,7 +1168,7 @@ class Database:
         q = urllib.parse.urlencode(
             {
                 "select": "entry_type,amount::text,category",
-                "order": "created_at.desc",
+                "order": "created_at.desc,id.desc",
                 "created_at": f"gte.{since}",
             }
         )
@@ -858,12 +1265,15 @@ class Database:
         logger.warning("تم تصفير الحسابات (بإبقاء العملاء): %s", counts)
         return counts
 
-    def monthly_report(self, offset_hours: int = 3) -> dict:
+    def monthly_report(self, offset_hours: int | None = None) -> dict:
         """تقرير شهري مقارن: هذا الشهر مقابل الشهر الماضي.
 
         يعيد لكل شهر: إجمالي الديون، السداد، الصافي، وعدد العمليات —
         مع معدل السداد الإجمالي (سداد هذا الشهر ÷ ديون هذا الشهر).
+        الحدود الزمنية تُحسب بتوقيت المحطة (TIMEZONE_OFFSET) لا توقيت الخادم.
         """
+        if offset_hours is None:
+            offset_hours = settings.timezone_offset  # إصلاح: لا قيمة صلبة 3
         now_local = datetime.now(timezone.utc) + timedelta(hours=offset_hours)
 
         def month_start(dt: datetime) -> datetime:
@@ -875,7 +1285,9 @@ class Database:
 
         this_start = month_start(now_local)
         next_start = next_month(now_local)
-        prev_start = next_month(this_start - timedelta(days=1))
+        # إصلاح تدقيق: كانت `next_month` تُستخدم هنا فتعيد بداية الشهر الحالي
+        # نفسه → مدى الشهر الماضي = فاصل فارغ دائماً (تقرير صفر خاطئ).
+        prev_start = month_start(this_start - timedelta(days=1))
         prev_end = this_start
 
         def _range(start_local: datetime, end_local: datetime) -> dict:
@@ -1055,7 +1467,11 @@ class Database:
         if not existing:
             raise ValueError("العميل غير موجود")
         q = urllib.parse.urlencode(
-            {"customer_id": f"eq.{customer_id}", "select": "amount::text,note,created_at,tx_type"}
+            {
+                "customer_id": f"eq.{customer_id}",
+                "select": "id,amount::text,note,created_at,tx_type",
+                "order": "created_at.desc,id.desc",  # إصلاح: ترتيب قطعي حاسم
+            }
         )
         _, rows = self._req("GET", "transactions", q)
         balance = to_decimal("0.00")
@@ -1063,16 +1479,14 @@ class Database:
             balance += to_decimal(r.get("amount", 0))
         last_activity = existing.get("last_activity_at")
         if not last_activity and rows:
-            last_activity = max((r.get("created_at", "") for r in rows))
+            last_activity = rows[0].get("created_at", "")  # مرتّبة أصلاً
         return {
             "customer": existing,
             "balance": balance,
             "count": len(rows),
             "txn_count": len(rows),
             "last_activity_at": last_activity,
-            "recent": sorted(
-                rows, key=lambda r: r.get("created_at", ""), reverse=True
-            )[:5],
+            "recent": rows[:5],
         }
 
 # مثيل وحيد (singleton)

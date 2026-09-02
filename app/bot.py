@@ -42,7 +42,7 @@ from app.config import Settings, settings as env_settings
 from app.errors import is_conflict_error, is_harmless_error, is_infrastructure_error
 from app.nlp.parser import parse_message
 from app.persistence import SupabasePersistence
-from app.services import db, to_decimal
+from app.services import _idempotency_ref, db, to_decimal
 
 logger = logging.getLogger(__name__)
 
@@ -199,13 +199,12 @@ def _hi_num(text: object) -> str:
     return str(text or "")
 
 
-_AR_WEEKDAYS = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
-
-
 def _fmt_dt(iso: object, with_time: bool = True) -> str:
-    """تنسيق ISO (UTC) إلى تاريخ رقمي غربي واضح حسب توقيت المحطة.
+    """تنسيق ISO (UTC) إلى تاريخ رقمي كامل dd/mm/yyyy حسب توقيت المحطة.
 
-    مثال: «2026/8/29 الأحد» أو «2026/8/29 الأحد · 9:05 م»
+    القرار الهندسي: التاريخ دائماً رقمي بالكامل بأصفار مثبتة (يوم/شهر/سنة)
+    مثل «01/09/2026» — لا أسماء أيام ولا صيغ نصية. ومع الوقت: «04:16 م»
+    (ساعة وسمتان مع ص/م).
     """
     if not iso:
         return "—"
@@ -214,13 +213,12 @@ def _fmt_dt(iso: object, with_time: bool = True) -> str:
         local = dt.astimezone(timezone(timedelta(hours=env_settings.timezone_offset)))
     except Exception:  # noqa: BLE001
         return str(iso)[:16]
-    day = _AR_WEEKDAYS[local.weekday()]
-    date = f"{local.year}/{local.month}/{local.day} {day}"
+    date = f"{local.day:02d}/{local.month:02d}/{local.year}"
     if not with_time:
         return date
     h12 = local.hour % 12 or 12
     ampm = "ص" if local.hour < 12 else "م"
-    return f"{date} · {h12}:{local.minute:02d} {ampm}"
+    return f"{date} · {h12:02d}:{local.minute:02d} {ampm}"
 
 
 def _md(text: object) -> str:
@@ -236,6 +234,31 @@ def _md2(text: object) -> str:
 def _fmt_money_md2(value) -> str:
     """تنسيق مبلغ آمن للدمج داخل رسالة MarkdownV2."""
     return _md2(_fmt_money(value))
+
+
+def _fmt_liters(value) -> str:
+    """تنسيق مقدار باللترات — 3 منازل عشرية مع إسقاط الأصفار الزائدة.
+
+    لا يستخدم to_decimal (المُقَوِّم النقدي بمنزلتين) حفاظاً على دقة أجزاء
+    اللتر (0.5 / 0.25) — يتعامل مع Decimal مباشرة أو عبر نصه الدقيق.
+    """
+    d = value if isinstance(value, Decimal) else Decimal(str(value))
+    s = f"{d:,.3f}".rstrip("0").rstrip(".")
+    return s if s not in ("", "-") else "0"
+
+
+def _fuel_ref(
+    customer_id: str, fuel_type: str, entry_type: str, amount: object
+) -> str:
+    """مفتاح تفرّد ذرّي لحركة وقود — يُغذّي UNIQUE(external_ref) في الترحيل 006.
+
+    نفس منطق نافذة الزمن (5 دقائق) المستخدم في النقد عبر _idempotency_ref،
+    مع بادئة تمييز صريحة fuel:<النوع> حتى لا يتصادم مفتاح اللترات مع مفتاح
+    النقد أبداً حتى لو تطابقت بقية المكونات.
+    """
+    signed = Decimal(str(amount)) if entry_type == "debit" else -Decimal(str(amount))
+    bucket = int(time.time() // (5 * 60))
+    return f"auto:fuel:{fuel_type}:{customer_id}:{entry_type}:{signed}:{bucket}"
 
 
 def _mono_table(header: list[str], rows: list[list[str]]) -> str:
@@ -611,7 +634,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "الاسم غير واضح بعد 'حساب/صافي' — أعد مع ذكر الاسم، مثال: حساب محمد"
             )
             return ConversationHandler.END
-        await _show_balance(update, result.customer)
+        # fuel_balance_only=True تعني «حساب محمد لتر مازوت» → كشف وقود فقط
+        await _show_balance(
+            update,
+            result.customer,
+            fuel_only=result.fuel_balance_only,
+            fuel_type=result.fuel_type,
+        )
         return ConversationHandler.END
 
     # ── المحاسبي الشخصي: دخل / مصروف (قيد على صندوق المالك) ──
@@ -637,6 +666,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if result.note:
             preview += f"الوصف: {_md(result.note)}\n"
         preview += "\nهل أنت متأكد؟ ردّ بـ *نعم* للمتابعة أو *لا* للإلغاء."
+        await update.effective_message.reply_text(
+            preview, parse_mode=ParseMode.MARKDOWN, reply_markup=_confirm_keyboard()
+        )
+        return STATE_PENDING_CONFIRM
+
+    # ── حساب اللترات (الوقود): دفتر مستقل لا يلمس النقد أبداً ──
+    if result.action == "fuel":
+        if result.uncertain or result.amount is None:
+            await update.effective_message.reply_text(
+                "لم أتمكن من تحديد عدد اللترات 🤔\n"
+                "أعد الرسالة مع المقدار بوضوح، مثال: دين محمد 50 لتر مازوت"
+            )
+            return ConversationHandler.END
+        if not result.customer:
+            await update.effective_message.reply_text(
+                "لم أتمكن من تحديد اسم العميل — أعد مع ذكر الاسم، مثال: دين محمد 50 لتر"
+            )
+            return ConversationHandler.END
+        fuel_label = "مازوت" if result.fuel_type == "mazot" else "بنزين"
+        direction = "سحب (دين)" if result.entry_type == "debit" else "إيداع (سداد)"
+        context.user_data["pending_tx"] = {
+            "kind": "fuel",
+            "customer": result.customer,
+            "amount": result.amount,
+            "entry_type": result.entry_type or "debit",
+            "fuel_type": result.fuel_type or "mazot",
+        }
+        preview = (
+            f"📋 *تأكيد حركة وقود* ⛽\n\n"
+            f"العميل: *{_md(result.customer)}*\n"
+            f"النوع: ⛽ {fuel_label} — {direction}\n"
+            f"المقدار: *{_fmt_liters(result.amount)} لتر*\n\n"
+            f"⚠️ هذه حركة *لترات* على الحساب الوقودي المستقل — "
+            f"لن يُمسّ الرصيد النقدي إطلاقاً.\n\n"
+            f"هل أنت متأكد؟ ردّ بـ *نعم* للمتابعة أو *لا* للإلغاء."
+        )
         await update.effective_message.reply_text(
             preview, parse_mode=ParseMode.MARKDOWN, reply_markup=_confirm_keyboard()
         )
@@ -677,7 +742,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "لم أفه الرسالة 🤔 — جرّب:\n"
         "• دين <الاسم> <المبلغ>\n"
         "• دفع <الاسم> <المبلغ>\n"
-        "• حساب <الاسم>"
+        "• دين <الاسم> <المقدار> لتر مازوت / بنزين\n"
+        "• حساب <الاسم>  (يعرض النقد واللترات معاً)\n"
+        "• حساب <الاسم> لتر مازوت  (كشف اللترات فقط)"
     )
     return ConversationHandler.END
 # ── حالة انتظار التأكيد (نصياً) ─────────────────────────────
@@ -724,6 +791,16 @@ def _find_duplicate(pending: dict, customer_id: str | None = None) -> dict | Non
         return db.find_recent_account_entry(
             pending["entry_type"], pending["amount"], minutes=5
         )
+    if pending.get("kind") == "fuel":
+        if customer_id is None:
+            return None
+        return db.find_recent_fuel_entry(
+            customer_id,
+            pending["fuel_type"],
+            pending["amount"],
+            pending["entry_type"],
+            minutes=5,
+        )
     if customer_id is None:
         return None
     return db.find_recent_transaction(
@@ -765,6 +842,51 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             context.user_data.pop("pending_tx", None)
             return ConversationHandler.END
 
+        if pending.get("kind") == "fuel":
+            customer_id, display = _resolve_customer(pending["customer"])
+            dup_fuel = db.find_recent_fuel_entry(
+                customer_id,
+                pending["fuel_type"],
+                Decimal(str(pending["amount"])),
+                pending["entry_type"],
+                minutes=5,
+            )
+            if dup_fuel:
+                await update.effective_message.reply_text(
+                    "⚠️ حركة الوقود هذه سُجلت مسبقاً قبل لحظات — "
+                    "لم أُدرجها مرة ثانية لتجنّب تكرار اللترات."
+                )
+                context.user_data.pop("pending_tx", None)
+                return ConversationHandler.END
+            db.add_fuel_entry(
+                customer_id,
+                Decimal(str(pending["amount"])),
+                pending["fuel_type"],
+                pending["entry_type"],
+                external_ref=_fuel_ref(
+                    customer_id,
+                    pending["fuel_type"],
+                    pending["entry_type"],
+                    pending["amount"],
+                ),
+            )
+            fuel_balance = db.get_fuel_balance(customer_id, pending["fuel_type"])
+            fuel_label = "مازوت" if pending["fuel_type"] == "mazot" else "بنزين"
+            direction = (
+                "سحب (دين)" if pending["entry_type"] == "debit" else "إيداع (سداد)"
+            )
+            await update.effective_message.reply_text(
+                f"✔ تم تسجيل حركة الوقود.\n\n"
+                f"العميل: *{_md(display)}*\n"
+                f"النوع: ⛽ {fuel_label} — {direction}\n"
+                f"المقدار: *{_fmt_liters(pending['amount'])} لتر*\n"
+                f"رصيد {fuel_label} الحالي: *{_fmt_liters(fuel_balance)} لتر*\n"
+                f"_(حساب اللترات مستقل تماماً عن الرصيد النقدي)_",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            context.user_data.pop("pending_tx", None)
+            return ConversationHandler.END
+
         customer_id, display = _resolve_customer(pending["customer"])
         dup = _find_duplicate(pending, customer_id)
         if dup:
@@ -774,7 +896,15 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             context.user_data.pop("pending_tx", None)
             return ConversationHandler.END
-        db.add_transaction(customer_id, Decimal(str(pending["amount"])), pending["action"], None)
+        db.add_transaction(
+            customer_id,
+            Decimal(str(pending["amount"])),
+            pending["action"],
+            None,
+            external_ref=_idempotency_ref(
+                customer_id, pending["action"], pending["amount"]
+            ),
+        )
         balance = db.get_balance(customer_id)
         kind = "دين" if pending["action"] == ACTION_DEBIT else "سداد"
         await update.effective_message.reply_text(
@@ -794,11 +924,17 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return STATE_PENDING_CONFIRM
     context.user_data.pop("pending_tx", None)
     return ConversationHandler.END
-async def _show_balance(update: Update, name: str) -> None:
-    """بطاقة رصيد احترافية: الرصيد المتبقي + آخر الحركات مرتبة ومصنّفة.
+async def _show_balance(
+    update: Update,
+    name: str,
+    fuel_only: bool = False,
+    fuel_type: str | None = None,
+) -> None:
+    """بطاقة رصيد احترافية متكاملة: رصيد نقدي + أرصدة لترات منفصلة.
 
-    «حساب <الاسم>» يعرض الرصيد المتبقي للعميل بوضوح ثم آخر 5 حركات
-    (دين 🔺 / سداد 🔻) مع التاريخ الرقمي — منظمة ومفهومة على الهاتف.
+    «حساب <الاسم>» يعرض الرصيد النقدي ثم قسم أرصدة الوقود (مازوت/بنزين)
+    مجزّأً بوضوح — فلا تختلط اللترات بالليرات أبداً — ثم آخر الحركات.
+    مع fuel_only=True («حساب محمد لتر مازوت») يُعرض كشف اللترات وحده.
     """
     try:
         cust = db.find_customer(name)
@@ -808,16 +944,84 @@ async def _show_balance(update: Update, name: str) -> None:
                 "لإنشائه أرسل: دين <الاسم> <المبلغ>"
             )
             return
+
+        # ── أرصدة الوقود تُجلب بأمان: قاعدة قديمة بلا جدول 006 → لا كسر ──
+        fuel_balances: dict[str, Decimal] | None = None
+        try:
+            fuel_balances = {
+                "mazot": db.get_fuel_balance(cust["id"], "mazot"),
+                "benzine": db.get_fuel_balance(cust["id"], "benzine"),
+            }
+        except Exception:  # noqa: BLE001 — جدول fuel_ledger غير مُهيّأ بعد
+            logger.info("جدول الوقود غير متاح عند عرض رصيد العميل %s", cust["id"])
+            fuel_balances = None
+        has_fuel = fuel_balances is not None and (
+            fuel_balances["mazot"] != 0 or fuel_balances["benzine"] != 0
+        )
+
+        if fuel_only:
+            if not has_fuel:
+                await update.effective_message.reply_text(
+                    f"⛽ لا توجد حركات لترات مسجلة للعميل *{_md(cust['name'])}* بعد.\n"
+                    "لتسجيلها أرسل مثلاً: دين محمد 50 لتر مازوت",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            if fuel_type and fuel_type in fuel_balances:
+                only = fuel_balances[fuel_type]
+                f_label = "مازوت" if fuel_type == "mazot" else "بنزين"
+                lines = [
+                    f"⛽ *رصيد {f_label} للعميل* — {_md(cust['name'])}",
+                    "━━━━━━━━━━━━━━━━━━━━",
+                    f"• {f_label}: *{_fmt_liters(only)} لتر*",
+                ]
+            else:
+                lines = [
+                    f"⛽ *كشف لترات العميل* — {_md(cust['name'])}",
+                    "━━━━━━━━━━━━━━━━━━━━",
+                    f"• مازوت: *{_fmt_liters(fuel_balances['mazot'])} لتر*",
+                    f"• بنزين: *{_fmt_liters(fuel_balances['benzine'])} لتر*",
+                ]
+            lines += ["", "_حساب اللترات مستقل تماماً عن الرصيد النقدي._"]
+            try:
+                activity_f = db.get_fuel_activity(
+                    cust["id"], fuel_type=fuel_type, limit=5
+                )
+            except Exception:  # noqa: BLE001
+                activity_f = []
+            if activity_f:
+                lines += ["", f"📋 *آخر حركات الوقود ({_hi_num(len(activity_f))}):*"]
+                for i, r in enumerate(activity_f, start=1):
+                    lit = _fmt_liters(r.get("liters", 0))
+                    icon = "🔺" if r.get("entry_type") == "debit" else "🔻"
+                    kind = "سحب" if r.get("entry_type") == "debit" else "إيداع"
+                    f_lbl = "مازوت" if r.get("fuel_type") == "mazot" else "بنزين"
+                    lines.append(
+                        f"• {_hi_num(i)}) {icon} {kind} {lit} لتر ({f_lbl})\n"
+                        f"    🕓 {_fmt_dt(r.get('created_at'))}"
+                    )
+            await update.effective_message.reply_text(
+                "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        # ── الكشف المتكامل: النقد ثم اللترات ثم الحركات ──
         balance = db.get_balance(cust["id"])
         activity = db.get_activity(cust["id"], limit=5)
 
         lines = [
             f"💳 *بطاقة العميل* — {_md(cust['name'])}",
             "━━━━━━━━━━━━━━━━━━━━",
-            f"🔴 الرصيد المتبقي: *{_fmt_money(balance)}*",
+            f"💰 الرصيد النقدي: *{_fmt_money(balance)}*",
         ]
+        if has_fuel:
+            lines += [
+                "⛽ *رصيد اللترات (حساب مستقل عن النقد):*",
+                f"   • مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر",
+                f"   • بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر",
+            ]
         if activity:
-            lines += ["", f"📋 *آخر الحركات ({_hi_num(len(activity))}):*"]
+            lines += ["", f"📋 *آخر الحركات النقدية ({_hi_num(len(activity))}):*"]
             for i, r in enumerate(activity, start=1):
                 amt = abs(to_decimal(r.get("amount", 0)))
                 kind = "دين" if r.get("tx_type") == "debit" else "سداد"
@@ -829,7 +1033,7 @@ async def _show_balance(update: Update, name: str) -> None:
                     f"    🕓 {_fmt_dt(r.get('created_at'))}"
                 )
         else:
-            lines += ["", "— لا توجد حركات مسجلة لهذا العميل بعد."]
+            lines += ["", "— لا توجد حركات نقدية مسجلة لهذا العميل بعد."]
         await update.effective_message.reply_text(
             "\n".join(lines), parse_mode=ParseMode.MARKDOWN
         )
@@ -893,6 +1097,52 @@ async def _execute_pending_from_callback(
             context.user_data.pop("pending_tx", None)
             return ConversationHandler.END
 
+        if pending.get("kind") == "fuel":
+            customer_id, display = _resolve_customer(pending["customer"])
+            dup_fuel = db.find_recent_fuel_entry(
+                customer_id,
+                pending["fuel_type"],
+                Decimal(str(pending["amount"])),
+                pending["entry_type"],
+                minutes=5,
+            )
+            if dup_fuel:
+                await _safe_edit(
+                    query,
+                    "⚠️ حركة الوقود هذه سُجلت مسبقاً قبل لحظات — لم أُدرجها مرة ثانية.",
+                )
+                context.user_data.pop("pending_tx", None)
+                return ConversationHandler.END
+            db.add_fuel_entry(
+                customer_id,
+                Decimal(str(pending["amount"])),
+                pending["fuel_type"],
+                pending["entry_type"],
+                external_ref=_fuel_ref(
+                    customer_id,
+                    pending["fuel_type"],
+                    pending["entry_type"],
+                    pending["amount"],
+                ),
+            )
+            fuel_balance = db.get_fuel_balance(customer_id, pending["fuel_type"])
+            fuel_label = "مازوت" if pending["fuel_type"] == "mazot" else "بنزين"
+            direction = (
+                "سحب (دين)" if pending["entry_type"] == "debit" else "إيداع (سداد)"
+            )
+            await _safe_edit(
+                query,
+                f"✔ تم تسجيل حركة الوقود.\n"
+                f"العميل: {_md(display)}\n"
+                f"النوع: ⛽ {fuel_label} — {direction}\n"
+                f"المقدار: {_fmt_liters(pending['amount'])} لتر\n"
+                f"رصيد {fuel_label} الحالي: {_fmt_liters(fuel_balance)} لتر\n"
+                f"_(حساب اللترات مستقل تماماً عن الرصيد النقدي)_",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            context.user_data.pop("pending_tx", None)
+            return ConversationHandler.END
+
         customer_id, display = _resolve_customer(pending["customer"])
         dup = _find_duplicate(pending, customer_id)
         if dup:
@@ -903,7 +1153,10 @@ async def _execute_pending_from_callback(
             context.user_data.pop("pending_tx", None)
             return ConversationHandler.END
         db.add_transaction(
-            customer_id, Decimal(str(pending["amount"])), pending["action"], None
+            customer_id, Decimal(str(pending["amount"])), pending["action"], None,
+            external_ref=_idempotency_ref(
+                customer_id, pending["action"], pending["amount"]
+            ),
         )
         balance = db.get_balance(customer_id)
         kind = "دين" if pending["action"] == ACTION_DEBIT else "سداد"
@@ -1123,6 +1376,35 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "undo_cancel":
         await _safe_edit(query, "تم إلغاء التراجع. ↩️")
+        return
+
+    if data.startswith("undofuel:"):
+        entry_id = data.split(":", 1)[1]
+        try:
+            entry = db.get_fuel_entry(entry_id)
+            if not entry:
+                await _safe_edit(query, "لم أجد حركة الوقود — ربما حُذفت مسبقاً.")
+                return
+            db.delete_fuel_entry(entry_id)
+            f_label = "مازوت" if entry.get("fuel_type") == "mazot" else "بنزين"
+            cust_name = (
+                (db.get_customer_by_id(entry.get("customer_id")) or {}).get("name")
+                or "العميل"
+            )
+            try:
+                bal = db.get_fuel_balance(entry["customer_id"], entry.get("fuel_type"))
+                bal_s = f"الرصيد الجديد: *{_fmt_liters(bal)} لتر*"
+            except Exception:  # noqa: BLE001
+                bal_s = ""
+            await _safe_edit(
+                query,
+                f"🗑️ تم حذف حركة الوقود ({f_label}) بنجاح.\n"
+                f"العميل: {cust_name}\n" + bal_s,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("فشل التراجع عن حركة وقود")
+            await _safe_edit(query, f"خطأ في التراجع: {str(exc)}")
         return
 
     if data.startswith(CALLBACK_UNDO_PREFIX):
@@ -1353,15 +1635,17 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 ["🕒 آخر نشاط", _fmt_dt(last) if last else "—"],
             ],
         )
-        msg_lines = [f"🪪 *بطاقة العميل* — {_md(c['name'])}", table, ""]
+        msg_lines = [f"🪪 *بطاقة العميل* — {_md2(c['name'])}", table, ""]
         if info["recent"]:
             msg_lines.append("*آخر 5 حركات:*")
             for r in info["recent"]:
                 amt = to_decimal(r.get("amount", 0))
                 kind = "دين" if r.get("tx_type") == "debit" else "سداد"
-                note = f" · {r.get('note')}" if r.get("note") else ""
+                raw_note = r.get("note")
+                note = f" · {_md2(raw_note)}" if raw_note else ""
                 msg_lines.append(
-                    f"• {kind} {_fmt_money(abs(amt))}{note} — {_fmt_dt(r.get('created_at'))}"
+                    f"• {kind} {_fmt_money_md2(abs(amt))}{note} "
+                    f"— {_md2(_fmt_dt(r.get('created_at')))}"
                 )
         await update.effective_message.reply_text(
             "\n".join(msg_lines), parse_mode=ParseMode.MARKDOWN_V2
@@ -1374,8 +1658,87 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ── كشف الحساب المالي الموحّد (الصيغة الهندسية المعتمدة) ──────
+_STMT_SEP = "──────────────────"
+
+
+def _stmt_amount(amount, tx_type: str) -> str:
+    """المبلغ بإشارته الظاهرة بعد الرقم: «7,000.00+ ل.س» مقبوضات،
+    «1,800.00- ل.س» مسحوبات/ديون — بالفواصل النظيفة ومنزلتين ثابتتين."""
+    d = to_decimal(amount)
+    sign = "-" if tx_type == "debit" else "+"
+    cur = (env_settings.currency or "").strip()
+    body = f"{_hi_num(f'{abs(d):,.2f}')}{sign}"
+    return f"{body} {cur}".strip()
+
+
+def _stmt_status(balance) -> str:
+    """سطر حالة الحساب بحسب صافي الرصيد (مدين/دائن/مُصفّر)."""
+    d = to_decimal(balance)
+    if d > 0:
+        return "⚖️ حالة الحساب: مدين — يوجد مبلغ مستحق على العميل."
+    if d < 0:
+        return "⚖️ حالة الحساب: دائن — للعميل رصيد مدفوع مسبقاً."
+    return "⚖️ حالة الحساب: مُصفّر بالكامل، شكراً لتعاملكم معنا."
+
+
+def _render_financial_statement(
+    name: str,
+    ledger: list[dict],
+    balance,
+    *,
+    now: datetime | None = None,
+    truncated_from: int | None = None,
+) -> str:
+    """توليد كشف الحساب المالي الموحد — نص صافٍ بلا Markdown
+    (أسماء العملاء تُعرض كما هي بلا أي خطر تهريب صيغة).
+
+    الهيكل المعتمد:
+      📊 كشـف الـحـسـاب الـمـالـي
+      👤 العميل: …
+      📅 تاريخ الجرد: 01/09/2026
+      ⏳ العمليات المسجلة (مرتبة زمنياً من الأقدم إلى الأحدث):
+      🟢 7,000.00+ ل.س · 31/08/2026 · 04:16 م
+      🔴 1,800.00- ل.س · 31/08/2026 · 04:47 م
+      ──────────────────
+      💰 الرصيد الصافي الحالي: 0.00 ل.س
+      ⚖️ حالة الحساب: مُصفّر بالكامل، شكراً لتعاملكم معنا.
+
+    يجب أن تأتي ledger مرتبة تصاعدياً زمنياً (خرج get_ledger)؛ فالترتيب
+    الزمني شرط هندسي للكشف لا مسؤولية العارض.
+    """
+    local_now = now or _local_now()
+    lines = [
+        "📊 كشـف الـحـسـاب الـمـالـي",
+        f"👤 العميل: {name}",
+        f"📅 تاريخ الجرد: {_hi_num(f'{local_now.day:02d}/{local_now.month:02d}/{local_now.year}')}",
+        "",
+    ]
+    if not ledger:
+        lines.append("⏳ لا توجد عمليات مسجلة على هذا الحساب بعد.")
+    else:
+        lines.append("⏳ العمليات المسجلة (مرتبة زمنياً من الأقدم إلى الأحدث):")
+        if truncated_from:
+            lines.append(
+                f"   (عرض آخر {_hi_num(str(len(ledger)))} حركة"
+                f" من إجمالي {_hi_num(str(truncated_from))})"
+            )
+        for r in ledger:
+            icon = "🟢" if r.get("tx_type") == "credit" else "🔴"
+            lines.append(
+                f"{icon} {_stmt_amount(r.get('amount', 0), r.get('tx_type', ''))}"
+                f" · {_fmt_dt(r.get('created_at'))}"
+            )
+    lines += [
+        _STMT_SEP,
+        f"💰 الرصيد الصافي الحالي: {_fmt_money(balance)}",
+        _stmt_status(balance),
+    ]
+    return "\n".join(lines)
+
+
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """كشف على معاملات عميل محدد:  /history <اسم>"""
+    """كشف الحساب المالي الموحد لعميل محدد:  /history <اسم>"""
     if not is_authorized(update):
         await _guard(update)
         return ConversationHandler.END
@@ -1394,25 +1757,24 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                 f"لم أجد عميلاً باسم «{name}» في السجلات."
             )
             return ConversationHandler.END
-        activity = db.get_activity(found["id"], limit=20)
-        if not activity:
+        ledger = db.get_ledger(found["id"])  # تصاعدي زمنياً: الأقدم ← الأحدث
+        if not ledger:
             await update.effective_message.reply_text(
-                f"لا توجد أي معاملات للعميل *{found['name']}*.",
+                f"لا توجد أي معاملات للعميل *{_md(found['name'])}*.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return ConversationHandler.END
         bal = db.get_balance(found["id"])
-        lines = [f"🧾 *سجل معاملات {found['name']}*", ""]
-        for r in activity:
-            amt = to_decimal(r.get("amount", 0))
-            kind = "دين" if r.get("tx_type") == "debit" else "سداد"
-            note = f" · {r.get('note')}" if r.get("note") else ""
-            lines.append(f"• {kind} {_fmt_money(abs(amt))}{note} ─ {_fmt_dt(r.get('created_at'))}")
-        lines.append("")
-        lines.append(f"⚖️ الرصيد الحالي: *{_fmt_money(bal)}*")
-        await update.effective_message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN
+        # حماية حد تليجرام (4096): آخر 80 حركة برصيدها الصافي الكامل
+        total = len(ledger)
+        shown = ledger[-80:] if total > 80 else ledger
+        statement = _render_financial_statement(
+            found["name"],
+            shown,
+            bal,
+            truncated_from=total if total > 80 else None,
         )
+        await update.effective_message.reply_text(statement)
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل عرض التاريخ")
         await update.effective_message.reply_text(f"خطأ في عرض التاريخ: {str(exc)}")
@@ -1804,7 +2166,11 @@ async def _render_history_page(
 
 # ── ميزات تحليلية عبقرية ─────────────────────────────────────
 async def cmd_debts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """الصافي دين: قائمة المدينين فقط + الإجمالي."""
+    """الصافي دين: قائمة المدينين فقط + الإجمالي.
+
+    مع قاعدة نموّ، قد تتجاوز قائمة كل المدينين حد 4096 حرفاً لرسالة تيليجرام —
+    لذلك تُقسَّم تلقائياً إلى جداول متتالية (كل جزء ≤ 3800 حرف أماناً).
+    """
     if not is_authorized(update):
         await _guard(update)
         return ConversationHandler.END
@@ -1815,18 +2181,44 @@ async def cmd_debts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 "🎉 لا يوجد أي ديون مستحقة — كل الحسابات مسددة!"
             )
             return ConversationHandler.END
-        table = _mono_table(
-            ["#", "العميل", "الرصيد"],
-            [
-                [_hi_num(i), str(c["name"]), _fmt_money(c["balance"])]
-                for i, c in enumerate(debtors, 1)
-            ],
-        )
-        await update.effective_message.reply_text(
-            f"🔴 *صافي الديون المستحقة*\n\n{table}\n\n"
-            f"💼 *إجمالي المستحق: {_fmt_money_md2(total)}*",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        header = "🔴 *صافي الديون المستحقة*"
+        footer = f"💼 *إجمالي المستحق: {_fmt_money_md2(total)}*"
+        rows = [
+            [_hi_num(i), str(c["name"]), _fmt_money(c["balance"])]
+            for i, c in enumerate(debtors, 1)
+        ]
+        # تقسيم المدينين إلى مجموعات: كل جدول يُبنى ويُفحص طوله فعلياً
+        _MAX_PART = 3800
+        parts: list[list[list[str]]] = []
+        current: list[list[str]] = []
+        for row in rows:
+            trial = current + [row]
+            if len(_mono_table(["#", "العميل", "الرصيد"], trial)) > _MAX_PART and current:
+                parts.append(current)
+                current = [row]
+            else:
+                current = trial
+        if current:
+            parts.append(current)
+
+        def _render(index: int) -> str:
+            table = _mono_table(["#", "العميل", "الرصيد"], parts[index])
+            num = "" if len(parts) == 1 else f" — {index + 1}/{len(parts)}"
+            return f"{header}{num}\n\n{table}"
+
+        first = _render(0)
+        if len(parts) == 1:
+            await update.effective_message.reply_text(
+                f"{first}\n\n{footer}",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            return ConversationHandler.END
+        await update.effective_message.reply_text(first, parse_mode=ParseMode.MARKDOWN_V2)
+        for idx in range(1, len(parts)):
+            body = _render(idx)
+            if idx == len(parts) - 1:
+                body = f"{body}\n\n{footer}"
+            await update.effective_message.reply_text(body, parse_mode=ParseMode.MARKDOWN_V2)
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل عرض الديون")
         await update.effective_message.reply_text(f"خطأ: {str(exc)}")
@@ -1996,6 +2388,40 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await update.effective_message.reply_text(f"لم أجد عميلاً باسم «{name}».")
             return ConversationHandler.END
         last = db.get_last_transaction(found["id"])
+        # ── حركات الوقود تدخل التراجع أيضاً: الأحدث زمنياً يُعرض دائماً ──
+        try:
+            fuel_rows = db.get_fuel_activity(found["id"], limit=1)
+        except Exception:  # noqa: BLE001 — قاعدة قديمة بلا جدول الوقود (006)
+            fuel_rows = []
+        fuel_last = fuel_rows[0] if fuel_rows else None
+        if fuel_last and (
+            not last
+            or str(fuel_last.get("created_at", "")) > str(last.get("created_at", ""))
+        ):
+            lit = abs(Decimal(str(fuel_last.get("liters", 0))))
+            f_label = "مازوت" if fuel_last.get("fuel_type") == "mazot" else "بنزين"
+            kind = (
+                "سحب (دين)"
+                if fuel_last.get("entry_type") == "debit"
+                else "إيداع (سداد)"
+            )
+            ts = str(fuel_last.get("created_at", ""))[:16]
+            note = f"\n📝 {fuel_last.get('note')}" if fuel_last.get("note") else ""
+            await update.effective_message.reply_text(
+                f"↩️ *آخر عملية للعميل {found['name']}*\n\n"
+                f"النوع: ⛽ {kind} — {f_label}\n"
+                f"المقدار: *{_fmt_liters(lit)} لتر*\n"
+                f"التاريخ: {ts}{note}\n\n"
+                f"هل تريد حذفها؟",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=inline_kb(
+                    [
+                        ("🗑️ نعم، احذفها", f"undofuel:{fuel_last['id']}"),
+                        ("❌ لا", "undo_cancel"),
+                    ]
+                ),
+            )
+            return ConversationHandler.END
         if not last:
             await update.effective_message.reply_text(
                 f"لا توجد أي معاملات للعميل *{found['name']}*.",
@@ -2130,7 +2556,7 @@ def build_application(settings: Settings) -> Application:
             on_nav_callback,
             pattern=(
                 r"^(page:\d+|quick|bal:[0-9a-fA-F-]+|undo:[0-9a-fA-F-]+|"
-                r"undo_cancel|menu:\w+|alert:(on|off|days:\d+)|"
+                r"undofuel:[0-9a-fA-F-]+|undo_cancel|menu:\w+|alert:(on|off|days:\d+)|"
                 r"hist:[0-9a-fA-F-]+:\d+|accadd:(income|expense)|"
                 r"resetmode:(soft|full)|resetyes:(soft|full)|reset_no)$"
             ),

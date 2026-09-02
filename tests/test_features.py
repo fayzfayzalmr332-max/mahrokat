@@ -313,6 +313,19 @@ def test_markdownv2_messages_are_escaped(monkeypatch):
         "today": {"count": 2, "debts": D("500"), "paid": D("200"), "net": D("700"),
                   "rows": [{"customer_name": "زاهر", "tx_type": "debit", "amount": D("500"),
                             "created_at": "2026-08-30T10:00:00"}]},
+        # بطاقة العميل: مبالغ عشرية وملاحظات تحوي نقطة — تكشف «. is reserved»
+        "card": {
+            "customer": {"id": "c1", "name": "زاهر (تأكيد)"},
+            "balance": D("905.50"),
+            "last_activity_at": "2026-08-30T10:00:00",
+            "txn_count": 5,
+            "recent": [
+                {"amount": D("905.50"), "tx_type": "debit", "note": "سداد نقدي. تم.",
+                 "created_at": "2026-08-30T10:05:00"},
+                {"amount": D("200.25"), "tx_type": "credit", "note": None,
+                 "created_at": "2026-08-30T09:00:00"},
+            ],
+        },
     }
 
     monkeypatch.setattr(sdb, "monthly_report", lambda: state["monthly"])
@@ -320,6 +333,8 @@ def test_markdownv2_messages_are_escaped(monkeypatch):
     monkeypatch.setattr(sdb, "stats", lambda: state["stats"])
     monkeypatch.setattr(sdb, "list_debtors", lambda: state["debtors"])
     monkeypatch.setattr(sdb, "today_summary", lambda: state["today"])
+    monkeypatch.setattr(sdb, "find_customer", lambda name: {"id": "c1", "name": state["card"]["customer"]["name"]})
+    monkeypatch.setattr(sdb, "customer_stats", lambda cid: state["card"])
 
     handlers = [
         botmod.cmd_report,
@@ -328,10 +343,11 @@ def test_markdownv2_messages_are_escaped(monkeypatch):
         botmod.cmd_debts,
         botmod.cmd_today,
         botmod.cmd_top,
+        botmod.cmd_card,
     ]
     for i, fn in enumerate(handlers):
         upd = _capture_update()
-        ctx = SimpleNamespace(args=[])
+        ctx = SimpleNamespace(args=["زاهر"] if fn is botmod.cmd_card else [])
         asyncio.run(fn(upd, ctx))
         assert upd.effective_message.sent, f"{fn.__name__} لم يرسل رسالة"
         for text, kw in upd.effective_message.sent:
@@ -340,6 +356,42 @@ def test_markdownv2_messages_are_escaped(monkeypatch):
                 assert _md2_validate(text), (
                     f"{fn.__name__} أرسل MarkdownV2 مكسوراً:\n{text!r}"
                 )
+
+
+def test_debts_splits_long_lists(monkeypatch):
+    """قائمة المدينين الطويلة تُقسَّم تلقائياً فلا تتجاوز حد 4096 حرفاً —
+    كان cmd_debts يُرسل جدولاً واحداً بكل المدينين فينهار بـ «Message is too long»."""
+    import asyncio  # noqa: PLC0415
+    from decimal import Decimal as D  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    debtors = [
+        {"id": f"c{i}", "name": f"عميل رقم {i:03d}", "balance": D(f"{i + 1}.50")}
+        for i in range(1, 121)
+    ]
+    total = D("7260.00")
+    monkeypatch.setattr(sdb, "list_debtors", lambda: (debtors, total))
+
+    upd = _capture_update()
+    ctx = SimpleNamespace(args=[])
+    asyncio.run(botmod.cmd_debts(upd, ctx))
+
+    sent = upd.effective_message.sent
+    assert len(sent) > 1, "كان ينبغي تقسيم القائمة إلى أكثر من رسالة واحدة"
+    for text, kw in sent:
+        assert len(text) <= 4096, (
+            f"رسالة تجاوزت حد 4096 بـ {len(text) - 4096} حرفاً زائداً"
+        )
+        pm = kw.get("parse_mode")
+        if pm is not None and "MARKDOWN" in str(pm):
+            assert _md2_validate(text), f"رسالة MarkdownV2 مكسورة:\n{text!r}"
+    # الإجمالي يظهر في الجزء الأخير
+    assert "إجمالي المستحق" in sent[-1][0]
+    # تدوين الترقيم يجعل الأجزاء مميزة
+    assert "2/" in sent[1][0]
 
 
 def test_weekly_alert_is_markdownv2_safe(monkeypatch):
@@ -416,17 +468,18 @@ def test_fmt_dt_western_numeric_format():
 
     # ISO معروف → اليوم يُستنتج حسب timezone_offset (افتراضياً +3)
     out = botmod._fmt_dt("2026-08-20T10:30:00+00:00")
-    assert "2026/8/20 الخميس" in out   # تاريخ رقمي غربي + اليوم
-    assert "أغسطس" not in out           # لا أسماء شهور عربية
+    assert out.startswith("20/08/2026")   # يوم/شهر/سنة بأصفار مثبتة
+    assert "الخميس" not in out            # لا أسماء أيام (صيغة رقمية فقط)
+    assert "أغسطس" not in out             # لا أسماء شهور عربية
+    assert "01:30 م" in out               # ساعة وسمتان ثنائيتا الرقم + ص/م
     assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in out)  # لا أرقام هندية
-    assert "م" in out or "ص" in out     # صباحاً/مساءً
 
 
 def test_fmt_dt_no_time():
     import app.bot as botmod  # noqa: PLC0415
 
     out = botmod._fmt_dt("2026-08-20T10:30:00+00:00", with_time=False)
-    assert out == "2026/8/20 الخميس"  # تاريخ فقط، بلا وقت، بأرقام غربية
+    assert out == "20/08/2026"  # تاريخ رقمي كامل فقط، بلا وقت
 
 
 def test_fmt_dt_empty_returns_dash():
@@ -434,6 +487,165 @@ def test_fmt_dt_empty_returns_dash():
 
     assert botmod._fmt_dt(None) == "—"
     assert botmod._fmt_dt("") == "—"
+
+
+def test_fmt_dt_zero_pads_single_digit_day_month_hour():
+    import app.bot as botmod  # noqa: PLC0415
+
+    # 2026-09-01T10:16Z + 3 → 01/09/2026 · 01:16 م (أصفار مثبتة إلزامياً)
+    out = botmod._fmt_dt("2026-09-01T10:16:00+00:00")
+    assert out == "01/09/2026 · 01:16 م"
+    assert "1/9/2026" not in out  # لا صيغة غير مبطّنة
+
+
+# ── كشف الحساب المالي الموحّد (_render_financial_statement) ──
+def _stmt(ledger, balance, currency="ل.س", now=(2026, 9, 1, 12, 0)):
+    """منشئ كشف موحّد للاختبارات مع تحكم بالعملة وتاريخ الجرد."""
+    import app.bot as botmod  # noqa: PLC0415
+
+    s = botmod.env_settings
+    old = getattr(s, "currency", "")
+    object.__setattr__(s, "currency", currency)
+    try:
+        return botmod._render_financial_statement(
+            "عبدو الجداح", ledger, balance, now=botmod.datetime(*now)
+        )
+    finally:
+        object.__setattr__(s, "currency", old)
+
+
+def test_statement_exact_approved_format_zero_balance():
+    """سيناريو المستخدم المرجعي حرفياً: تصفير كامل بعد 4 حركات."""
+    ledger = [
+        {"amount": "7000", "tx_type": "credit", "created_at": "2026-08-31T13:16:00+00:00"},
+        {"amount": "2000", "tx_type": "credit", "created_at": "2026-08-31T13:18:00+00:00"},
+        {"amount": "1800", "tx_type": "debit", "created_at": "2026-08-31T13:47:00+00:00"},
+        {"amount": "7200", "tx_type": "debit", "created_at": "2026-08-31T18:05:00+00:00"},
+    ]
+    out = _stmt(ledger, "0.00")
+    lines = out.splitlines()
+    assert lines[0] == "📊 كشـف الـحـسـاب الـمـالـي"
+    assert "👤 العميل: عبدو الجداح" in out
+    assert "📅 تاريخ الجرد: 01/09/2026" in out
+    assert "⏳ العمليات المسجلة (مرتبة زمنياً من الأقدم إلى الأحدث):" in out
+    # الأسطر الحركية بالصيغة المعتمدة تماماً: 🟢+ للمقبوضات، 🔴- للمسحوبات
+    assert "🟢 7,000.00+ ل.س · 31/08/2026 · 04:16 م" in out
+    assert "🟢 2,000.00+ ل.س · 31/08/2026 · 04:18 م" in out
+    assert "🔴 1,800.00- ل.س · 31/08/2026 · 04:47 م" in out
+    assert "🔴 7,200.00- ل.س · 31/08/2026 · 09:05 م" in out
+    assert "──────────────────" in out
+    assert "💰 الرصيد الصافي الحالي: 0.00 ل.س" in out
+    assert "⚖️ حالة الحساب: مُصفّر بالكامل، شكراً لتعاملكم معنا." in out
+    # ترتيب تصاعدي فعلي: مقبوضات الأقدم قبل مسحوبات الأحدث
+    assert out.index("7,000.00+") < out.index("7,200.00-")
+
+
+def test_statement_icons_and_signs_match_tx_types():
+    """الإيموجي والإشارة مقيدان بنوع الحركة لا بموضعها."""
+    ledger = [
+        {"amount": "500", "tx_type": "debit", "created_at": "2026-08-31T13:00:00+00:00"},
+        {"amount": "1200.5", "tx_type": "credit", "created_at": "2026-08-31T14:00:00+00:00"},
+    ]
+    out = _stmt(ledger, "700.50")
+    assert "🔴 500.00- ل.س" in out        # دين → أحمر وسالب
+    assert "🟢 1,200.50+ ل.س" in out      # مقبوضات → أخضر وموجب
+    assert "💰 الرصيد الصافي الحالي: 700.50 ل.س" in out
+    assert "⚖️ حالة الحساب: مدين" in out
+
+
+def test_statement_status_debtor_creditor_variants():
+    debtor = _stmt(
+        [{"amount": "300", "tx_type": "debit", "created_at": "2026-08-31T13:00:00+00:00"}],
+        "300.00",
+    )
+    assert "⚖️ حالة الحساب: مدين — يوجد مبلغ مستحق على العميل." in debtor
+    creditor = _stmt(
+        [{"amount": "450", "tx_type": "credit", "created_at": "2026-08-31T13:00:00+00:00"}],
+        "-450.00",
+    )
+    assert "⚖️ حالة الحساب: دائن — للعميل رصيد مدفوع مسبقاً." in creditor
+    assert "💰 الرصيد الصافي الحالي: -450.00 ل.س" in creditor
+
+
+def test_statement_empty_ledger_branch():
+    out = _stmt([], "0.00")
+    assert "⏳ لا توجد عمليات مسجلة على هذا الحساب بعد." in out
+    assert "مرتبة زمنياً" not in out       # لا قسم حركات فارغ
+    assert "💰 الرصيد الصافي الحالي: 0.00 ل.س" in out
+    assert "⚖️ حالة الحساب: مُصفّر بالكامل، شكراً لتعاملكم معنا." in out
+
+
+def test_statement_without_currency_configured():
+    """CURRENCY فارغ → المبالغ بإشارتها فقط بلا لاحقة عملة."""
+    ledger = [
+        {"amount": "7000", "tx_type": "credit", "created_at": "2026-08-31T13:16:00+00:00"},
+    ]
+    out = _stmt(ledger, "7000.00", currency="")
+    assert "🟢 7,000.00+ · 31/08/2026 · 04:16 م" in out
+    assert "💰 الرصيد الصافي الحالي: 7,000.00" in out
+
+
+def test_statement_truncation_note():
+    import app.bot as botmod  # noqa: PLC0415
+
+    ledger = [
+        {"amount": "10", "tx_type": "credit", "created_at": "2026-08-31T13:00:00+00:00"}
+    ]
+    s = botmod.env_settings
+    old = getattr(s, "currency", "")
+    object.__setattr__(s, "currency", "")
+    try:
+        out = botmod._render_financial_statement(
+            "عميل", ledger, "10.00",
+            now=botmod.datetime(2026, 9, 1),
+            truncated_from=120,
+        )
+    finally:
+        object.__setattr__(s, "currency", old)
+    assert "(عرض آخر 1 حركة من إجمالي 120)" in out
+
+
+def test_statement_net_matches_ledger_sum_fuzz():
+    """خصائص عشوائية: صافي الكشف = مجموع الحركات الموقّعة دائماً،
+    وكل سطر يحمل أيقونة/إشارة مطابقة لنوع حركته وحالة صحيحة."""
+    import random  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+
+    rng = random.Random(99)
+    for _case in range(60):
+        running_dec = botmod.to_decimal("0")
+        ledger = []
+        for n in range(rng.randint(1, 12)):
+            amt = botmod.to_decimal(str(rng.randint(1, 90000)))
+            ttype = rng.choice(["debit", "credit"])
+            running_dec = running_dec + (amt if ttype == "credit" else -amt)
+            ledger.append(
+                {
+                    "amount": str(amt),
+                    "tx_type": ttype,
+                    "created_at": f"2026-08-31T13:{10 + n:02d}:00+00:00",
+                }
+            )
+        out = _stmt(ledger, str(running_dec), currency="")
+        lines = out.splitlines()
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("⏳")) + 1
+        sep = lines.index("──────────────────")
+        moves = lines[start:sep]
+        assert len(moves) == len(ledger)      # كل حركة لها سطر بالترتيب
+        for ln, row in zip(moves, ledger):
+            assert ln.startswith("🟢") == (row["tx_type"] == "credit")
+            assert ln.startswith("🔴") == (row["tx_type"] == "debit")
+            assert ("+" in ln) == (row["tx_type"] == "credit")
+            assert ("-" in ln) == (row["tx_type"] == "debit")
+        net_line = next(ln for ln in lines if "الرصيد الصافي" in ln)
+        assert f"{running_dec:,.2f}" in net_line  # مطابقة الصافي الحسابية
+        if running_dec > 0:
+            assert "مدين" in out
+        elif running_dec < 0:
+            assert "دائن" in out
+        else:
+            assert "مُصفّر بالكامل" in out
 
 
 # ── بطاقة العميل /card ────────────────────────────────────────
@@ -501,7 +713,7 @@ def test_card_command_output(monkeypatch):
     assert upd.effective_message.sent
     text = upd.effective_message.sent[0][0]
     assert "زاهر" in text
-    assert "2026/8/20" in text          # تاريخ رقمي غربي
+    assert "20/08/2026" in text         # تاريخ رقمي كامل مبطّن (dd/mm/yyyy)
     assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
 
 
@@ -530,6 +742,10 @@ def test_show_balance_professional_output(monkeypatch):
 
     monkeypatch.setattr(sdb, "find_customer", lambda name: {"id": "c1", "name": "عبدو"})
     monkeypatch.setattr(sdb, "get_balance", lambda cid: D("0.00"))
+    # عزل جدول الوقود: أرصدة صفرية → قسم اللترات يختفي من البطاقة تماماً
+    monkeypatch.setattr(
+        sdb, "get_fuel_balance", lambda cid, ft=None: D("0.000")
+    )
     monkeypatch.setattr(
         sdb,
         "get_activity",
@@ -546,13 +762,14 @@ def test_show_balance_professional_output(monkeypatch):
     assert upd.effective_message.sent
     text = upd.effective_message.sent[0][0]
     assert "بطاقة العميل" in text
-    assert "الرصيد المتبقي" in text
+    assert "الرصيد النقدي" in text          # الكشف المتكامل: قسم النقد أولاً
+    assert "⛽" not in text                  # صفر لترات → لا قسم وقود (لا زحام)
     assert "عبدو" in text
     assert "0.00" in text
     # الحركات مصنّفة بالنوع
     assert "سداد" in text and "دين" in text
-    # تاريخ رقمي غربي (توقيت +3: 18:05 UTC → 21:05، 13:16 UTC → 16:16)
-    assert "2026/8/31" in text
+    # تاريخ رقمي كامل مبطّن (توقيت +3: 18:05 UTC → 21:05، 13:16 UTC → 16:16)
+    assert "31/08/2026" in text
     assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
 
 

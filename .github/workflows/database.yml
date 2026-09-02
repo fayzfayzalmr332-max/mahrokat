@@ -1,0 +1,104 @@
+name: database-ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: database-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 1) اختبارات الكود — حارس انحدار منطق البوت المالي
+  # ─────────────────────────────────────────────────────────────
+  tests:
+    name: اختبارات الكود (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: تثبيت التبعيات
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: تشغيل كامل المنظومة الاختبارية
+        run: python -m pytest -q
+
+  # ─────────────────────────────────────────────────────────────
+  # 2) التحقق من المخطط — Postgres 16 نظيف بلا أي أسرار
+  #    يثبت: يُطبَّق من صفحة بيضاء + قابل لإعادة التطبيق (Idempotent)
+  # ─────────────────────────────────────────────────────────────
+  db-validate:
+    name: التحقق من المخطط (Postgres 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mahrokat
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGPASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: تطبيق المخطط الموحد — الضربة الأولى
+        run: >
+          psql -h localhost -U postgres -d mahrokat -v ON_ERROR_STOP=1
+          -f supabase/migrations/20260902000000_master_schema.sql
+
+      - name: إعادة التطبيق — إثبات Idempotency (يجب أن ينجح ثانية)
+        run: >
+          psql -h localhost -U postgres -d mahrokat -v ON_ERROR_STOP=1
+          -f supabase/migrations/20260902000000_master_schema.sql
+
+      - name: مطابقة الكائنات (6 جداول / 6 Views / 5 دوال / 4 إعدادات)
+        run: >
+          psql -h localhost -U postgres -d mahrokat -v ON_ERROR_STOP=1
+          -f supabase/verify_schema.sql
+
+  # ─────────────────────────────────────────────────────────────
+  # 3) النشر إلى Supabase — بعد نجاح الفحصين فقط، وعلى master
+  #    يتطلب 3 أسرار في إعدادات المستودع (انظر docs/DEPLOYMENT.md)
+  # ─────────────────────────────────────────────────────────────
+  db-deploy:
+    name: النشر إلى Supabase (Production)
+    needs: [tests, db-validate]
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: ربط المشروع
+        run: supabase link --project-ref "$SUPABASE_PROJECT_ID"
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+
+      - name: دفع الترحيلات
+        run: supabase db push --include-all
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
