@@ -39,8 +39,12 @@ jobs:
   #    يثبت: يُطبَّق من صفحة بيضاء + قابل لإعادة التطبيق (Idempotent)
   # ─────────────────────────────────────────────────────────────
   db-validate:
-    name: التحقق من المخطط (Postgres 16)
+    name: التحقق من المخطط — ${{ matrix.scenario == 'fresh' && 'صفحة بيضاء' || 'محاكاة قاعدة قديمة (001+002)' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [fresh, legacy]
     services:
       postgres:
         image: postgres:16
@@ -63,6 +67,12 @@ jobs:
         run: >
           psql -h localhost -U postgres -d mahrokat -v ON_ERROR_STOP=1
           -f supabase/ci_bootstrap.sql
+
+      - name: محاكاة قاعدة قديمة — تطبيق 001+002 الأصليين (سيناريو legacy فقط)
+        if: matrix.scenario == 'legacy'
+        run: |
+          psql -h localhost -U postgres -d mahrokat -v ON_ERROR_STOP=1 -f migrations/archive/001_init.sql
+          psql -h localhost -U postgres -d mahrokat -v ON_ERROR_STOP=1 -f migrations/archive/002_accountant_alerts.sql
 
       - name: تطبيق المخطط الموحد — الضربة الأولى
         run: >

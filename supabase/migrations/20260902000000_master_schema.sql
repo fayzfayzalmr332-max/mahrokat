@@ -50,11 +50,6 @@ create table if not exists public.customers (
 comment on table public.customers is 'عملاء المحطة — يُنشأ الحساب تلقائياً عند أول ذكر للاسم';
 comment on column public.customers.name_normalized
     is 'الاسم بعد التطبيع الصارم (أ/إ/آ←ا، ة←ه، ى←ي، ؤ/ئ←ء) لمنع أي تكرار';
-comment on column public.customers.last_activity_at
-    is 'آخر لحظة تم فيها أي معاملة للعميل — أساس التنبيه الأسبوعي لغير النشطين';
-comment on column public.customers.updated_at
-    is 'آخر تعديل على سجل العميل (يُحدَّث تلقائياً عبر trigger)';
-
 -- ── 1.2) حركات النقد (الديون والسداديات) ─────────────────────────
 create table if not exists public.transactions (
     id           uuid primary key default gen_random_uuid(),
@@ -78,13 +73,6 @@ create table if not exists public.transactions (
 );
 
 comment on column public.transactions.amount is 'دين موجبة (+)، سداد سالبة (−) — دائماً numeric(15,2)';
-comment on column public.transactions.external_ref
-    is 'مرجع خارجي اختياري (رقم وصل/فاتورة) بهدف منع تسجيل الحركة مرتين';
-comment on column public.transactions.seq
-    is 'رقم تسلسلي رتيب يعكس ترتيب الإدراج الفعلي — حاسم عند تساوي created_at';
-comment on column public.transactions.updated_at
-    is 'علامة تغيير على حركة مالية — أي تعديل يُسجَّل في audit_log معاً';
-
 -- ── 1.3) المحاسبي الشخصي للمالك ──────────────────────────────────
 create table if not exists public.account_entries (
     id         uuid primary key default gen_random_uuid(),
@@ -388,6 +376,27 @@ begin
     end if;
 end;
 $$;
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 2.4) توثيق الأعمدة المتأخرة — بعد ضمان وجودها في §2.1
+--      ⚠️ كانت في §1 وكانت تفجّر 42703 على قواعد قديمة (001+002):
+--         العمود لا يوجد بعد عند تنفيذ التعليق. هنا آمنة على المسارين.
+-- ═══════════════════════════════════════════════════════════════════
+comment on column public.customers.last_activity_at
+    is 'آخر لحظة تم فيها أي معاملة للعميل — أساس التنبيه الأسبوعي لغير النشطين';
+comment on column public.customers.updated_at
+    is 'آخر تعديل على سجل العميل (يُحدَّث تلقائياً عبر trigger)';
+comment on column public.transactions.external_ref
+    is 'مرجع خارجي اختياري (رقم وصل/فاتورة) بهدف منع تسجيل الحركة مرتين';
+comment on column public.transactions.seq
+    is 'رقم تسلسلي رتيب يعكس ترتيب الإدراج الفعلي — حاسم عند تساوي created_at';
+comment on column public.transactions.updated_at
+    is 'علامة تغيير على حركة مالية — أي تعديل يُسجَّل في audit_log معاً';
+comment on column public.account_entries.updated_at
+    is 'آخر تعديل على القيد المحاسبي الشخصي';
+comment on constraint ck_transactions_sign on public.transactions
+    is 'القيد الذهبي: debit موجب حصراً و credit سالب حصراً';
+
 
 -- ═══════════════════════════════════════════════════════════════════
 -- §3) الدوال (Triggers Infrastructure + RPC)
