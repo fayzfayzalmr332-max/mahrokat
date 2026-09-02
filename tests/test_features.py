@@ -1008,3 +1008,77 @@ def test_aging_new_format_sections(monkeypatch):
     assert "2 عميل" in text
     # الإجمالي العام
     assert "1,800" in text
+
+
+def test_customer_list_no_data_concatenation(monkeypatch):
+    """اختبار الفصل التام بين العملاء في قائمة العملاء — بلا تداخل أسماء مع عمليات."""
+    import asyncio  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import Database, _idempotency_ref  # noqa: PLC0415
+
+    db = Database()
+    db._drop_external_ref = False
+
+    # عميلان لكل منهما عمليات مختلفة
+    customers = [
+        {"id": "c1", "name": "عبدو", "balance": "7000.00"},
+        {"id": "c2", "name": "محمد", "balance": "3000.00"},
+    ]
+
+    ledger_c1 = [
+        {"created_at": "2026-08-31T16:16:00+00:00", "tx_type": "debit",
+         "amount": "7000.00", "running_balance": "7000.00"},
+    ]
+    ledger_c2 = [
+        {"created_at": "2026-08-31T16:18:00+00:00", "tx_type": "debit",
+         "amount": "3000.00", "running_balance": "3000.00"},
+    ]
+
+    def fake_get_ledger(cid):
+        return ledger_c1 if cid == "c1" else ledger_c2
+
+    monkeypatch.setattr(db, "get_ledger", fake_get_ledger)
+    monkeypatch.setattr(botmod, "db", db)
+
+    class _Msg:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append((text, kw))
+
+    class _Usr:
+        id = 1
+
+    class _Upd:
+        effective_message = _Msg()
+        effective_user = _Usr()
+        callback_query = None
+
+    upd = _Upd()
+    ctx = SimpleNamespace(user_data={})
+
+    asyncio.run(botmod._render_customer_page(upd, ctx, customers, 0))
+
+    # الرسالة الأولى يجب أن تحتوي كلا العميلين
+    first = upd.effective_message.sent[0][0]
+    assert "عبدو" in first, "العميل الأول مفقود"
+    assert "محمد" in first, "العميل الثاني مفقود"
+
+    # الفصل التام: اسم كل عميل يظهر مرة واحدة فقط (لا تكرار/تداخل)
+    assert first.count("عبدو") == 1, "اسم عبدو متكرر — تداخل!"
+    assert first.count("محمد") == 1, "اسم محمد متكرر — تداخل!"
+
+    # كل عملياته تحته مباشرة — التاريخ والمبلغ الصحيح
+    assert "7,000.00" in first, "مبلغ عبدو مفقود"
+    assert "3,000.00" in first, "مبلغ محمد مفقود"
+
+    # الرسالة في مربع كود (نسخ بضغطة واحدة)
+    assert first.startswith("```"), "الرسالة ليست في مربع كود"
+    assert first.rstrip().endswith("```"), "مربع الكود غير مقفل"
+
+    # تنسيق MarkdownV2 (لا يوجد تنسيق MARKDOWN القديم)
+    assert upd.effective_message.sent[0][1].get("parse_mode") == "MarkdownV2"
+

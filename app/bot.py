@@ -304,23 +304,47 @@ def _fmt_dt_compact(iso: object) -> str:
     )
 
 
+def _visual_width(s: str) -> int:
+    """العرض المرئي في خط ثابت العرض: العربية والإيموجي خليتان، سواهما خلية."""
+    w = 0
+    for ch in str(s or ""):
+        o = ord(ch)
+        if o > 127:  # غير ASCII: عربية، إيموجي، رموز
+            w += 2
+        else:
+            w += 1
+    return w
+
+
 def _cell(text: object, width: int, align: str = "l") -> str:
-    """خلية جدول بمسافات ثابتة (l يسار / r يمين للأرقام)."""
+    """خلية جدول بمسافات ثابتة — تحسب العرض المرئي لا عدد المحارف."""
     s = str(text or "")
-    s = s[:width] if len(s) > width else s
-    return s.rjust(width) if align == "r" else s.ljust(width)
+    vw = _visual_width(s)
+    if vw > width:
+        # اقتطاع ذكي بحيث لا يتجاوز العرض المرئي المطلوب
+        out, cur = [], 0
+        for ch in s:
+            step = 2 if ord(ch) > 127 else 1
+            if cur + step > width:
+                break
+            out.append(ch)
+            cur += step
+        s = "".join(out)
+        vw = cur
+    pad = " " * (width - vw)
+    return pad + s if align == "r" else s + pad
 
 
 def _grid(
     header: list[str], rows: list[list[str]], aligns: list[str]
 ) -> list[str]:
-    """جدول نصي بمسافات ثابتة — أسطر جاهزة داخل كتلة الكود الموحدة."""
+    """جدول نصي بمسافات ثابتة — الأعمدة متراصة بصرياً حتى مع العربية."""
     n = len(header)
-    widths = [len(header[i]) for i in range(n)]
+    widths = [_visual_width(header[i]) for i in range(n)]
     for r in rows:
         for i in range(n):
             cell = r[i] if i < len(r) else ""
-            widths[i] = max(widths[i], min(len(cell), 30))
+            widths[i] = max(widths[i], min(_visual_width(cell), 30))
     out = [" | ".join(_cell(header[i], widths[i]) for i in range(n))]
     out.append("-+-".join("-" * widths[i] for i in range(n)))
     out += [
@@ -332,50 +356,71 @@ def _grid(
     return out
 
 
-def _code_page(lines: list[str]) -> str:
-    """كتلة كود كاملة: تُفتح وتُقفل — النسخ بضغطة واحدة يحمل الرسالة كلها.
-
-    تُعقِّم أي علامة اقتباس خلفية داخل المحتوى حتى لا تكسر سور الكتلة.
-    """
-    safe = [str(ln).replace("`", "ʼ").replace("\\", "﹨") for ln in lines]
-    return "```\n" + "\n".join(safe) + "\n```"
-
-
 def _split_pages(
     meta: list[str], table: list[str], footer: list[str]
 ) -> list[list[str]]:
-    """يضمن عرض «كل» العمليات مهما كان عددها ضمن حد تليجرام (4096).
+    """يحوّل الجدول النصي إلى كتلة واحدة ويفوض التصفح إلى _group_customer_blocks.
 
-    يقسّم سجل العمليات إلى صفحات متتالية، كل رسالة كتلة كود كاملة
-    تنتهي بقفل التنسيق، مع تكرار ترويسة الجدول في كل صفحة، وإلحاق
-    الإجماليات بالصفحة الأخيرة فقط.
+    الجدول من _grid هو list[str] — يُغلَف ككتلة واحدة فلا يَشُقّ الجدول عبر
+    صفحتين، ويُضاف فوقه الترويسة (meta) وتحته الإجماليات (footer).
     """
+    blocks = [table] if table else []
+    return _group_customer_blocks(meta, blocks, footer)
+
+
+def _group_customer_blocks(
+    meta: list[str], blocks: list[list[str]], footer: list[str]
+) -> list[list[str]]:
+    """يجمع كتل العملاء في صفحات — لا يَشُقّ أي عميل عبر صفحتين.
+
+    كل كتلة عميل وحدة ذرّية: اسمه فوق جدول عملياته، فلا يُفصل رأس عن جدوله
+    أبداً، ويظل كل عميل كتلة واحدة متكاملة داخل رسالة واحدة — فلا تداخل أسماء
+    مع عمليات عملاء آخرين مهما كان العدد.
+    """
+
     def sz(lines: list[str]) -> int:
         return sum(len(x) + 1 for x in lines)
 
-    if not table:
+    if not blocks:
         return [meta + ([""] + footer if footer else [])]
-    if sz(meta) + sz(table) + sz(footer) + 8 <= _CARD_BUDGET:
-        return [meta + [""] + table + ([""] + footer if footer else [])]
 
-    head, sep, rows = table[0], table[1], table[2:]
     pages: list[list[str]] = []
     cur: list[str] = list(meta) + [""]
-    page_no = 1
-    for row in rows:
-        if sz(cur) + len(row) + 1 + 8 > _CARD_BUDGET:
+
+    for block in blocks:
+        block_sz = sz(block) + 1  # +1 للسطر الفارغ بعد الكتلة
+        cur_sz = sz(cur)
+
+        # لو إضافة الكتلة تتجاوز الميزانية والصفحة ليست فارغة → اختم الحالية
+        if cur_sz + block_sz + 8 > _CARD_BUDGET and cur != list(meta) + [""]:
             pages.append(cur)
-            page_no += 1
-            cur = [f"— تتمة سجل العمليات ({page_no}) —", head, sep]
-        cur.append(row)
+            cur = ["— تتمة القائمة —", ""]
+
+        cur.extend(block)
+        cur.append("")  # سطر فارغ بعد كل عميل للفصل البصري
+
+    # الإجماليات ختام الصفحة الأخيرة
     if footer:
-        if sz(cur) + sz(footer) + 8 > _CARD_BUDGET:
+        cur_sz = sz(cur)
+        footer_sz = sz(footer)
+        if cur_sz + footer_sz + 8 > _CARD_BUDGET and cur != list(meta) + [""]:
             pages.append(cur)
-            page_no += 1
-            cur = [f"— تتمة سجل العمليات ({page_no}) —", head, sep]
-        cur += [""] + footer
+            cur = ["— تتمة القائمة —", ""]
+        cur.extend(footer)
+
     pages.append(cur)
     return pages
+
+
+def _code_page(lines: list[str]) -> str:
+    """كتلة كود كاملة: تُفتح وتُقفل — النسخ بضغطة واحدة يحمل الرسالة كلها.
+
+    تُعقِّم أي علامة اقتباس خلفية داخل المحتوى حتى لا تكسر سور الكتلة،
+    وتبدأ بعلامة LTR لفرض اتجاه القراءة من لليسار — يمنع تداخل العربية
+    مع التنسيق الثابت العرض داخل الكود.
+    """
+    safe = [str(ln).replace("`", "ʼ").replace("\\", "﹨") for ln in lines]
+    return "```\n\u200E" + "\n".join(safe) + "\n```"
 
 
 def _fmt_money_s(value) -> str:
@@ -1366,18 +1411,42 @@ PAGE_SIZE = 8
 
 
 async def _render_customer_page(update, context, customers, page: int) -> None:
-    """يعرض صفحة من العملاء مع أزرار تنقّل."""
+    """يعرض صفحة من العملاء — كل عميل بسجل عملياته الكامل في جدول شبكي موحّد.
+
+    مربع نسخ واحد شامل: اسم العميل ورصيده فوق جدول عملياته (التاريخ، النوع،
+    المبلغ، الرصيد التراكمي) — وأسطر مرصوصة داخل كتلة كود مكتملة القفل.
+    النسخ بضغطة واحدة ينقل كل شيء، والفصل بين العملاء بصري تام بلا تداخل.
+    """
     total = len(customers)
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     start = page * PAGE_SIZE
     chunk = customers[start : start + PAGE_SIZE]
 
-    lines = [f"🗂️ *قائمة العملاء — صفحة {page + 1}/{pages}*", ""]
+    meta = [f"🗂️ قائمة العملاء — صفحة {page + 1}/{pages}", ""]
+    blocks: list[list[str]] = []
+
     for c in chunk:
+        name = c.get("name", "—")
         bal = to_decimal(c.get("balance", 0))
         sign = "🔴" if bal > 0 else ("🟢" if bal < 0 else "⚪")
-        lines.append(f"{sign} {_md(c['name'])}: *{_fmt_money(bal)}*")
+        header = f"{sign} {name} — الرصيد: {_fmt_money(bal)}"
+
+        ledger = db.get_ledger(c.get("id"))
+        if ledger:
+            rows, _ = _cash_card_rows(ledger)
+            grid = _grid(
+                ["التاريخ", "النوع", "المبلغ", "الرصيد"],
+                rows,
+                ["l", "l", "r", "r"],
+            )
+            blocks.append([header, *grid])
+        else:
+            blocks.append([header, "  (لا عمليات مسجلة)"])
+
+    footer = [f"إجمالي العملاء: {total}"]
+
+    pages_blocks = _group_customer_blocks(meta, blocks, footer)
 
     nav = []
     if page > 0:
@@ -1393,18 +1462,24 @@ async def _render_customer_page(update, context, customers, page: int) -> None:
         kb.append(nav)
     kb.append([InlineKeyboardButton("⚡ رصيد سريع", callback_data=CALLBACK_QUICK)])
     keyboard = InlineKeyboardMarkup(kb)
-    text = "\n".join(lines)
+
+    text = _code_page(pages_blocks[0] if pages_blocks else meta + ["", "لا بيانات."])
 
     if update.callback_query:
         await _safe_edit(
             update.callback_query,
             text,
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=keyboard,
         )
     else:
         await update.effective_message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard
+        )
+
+    for extra in pages_blocks[1:]:
+        await update.effective_message.reply_text(
+            _code_page(extra), parse_mode=ParseMode.MARKDOWN_V2
         )
 
 
