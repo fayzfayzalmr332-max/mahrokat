@@ -360,6 +360,7 @@ def _render_customer_card(
                 _fmt_dt_compact(r.get("created_at")),
             )
         )
+    net_plain = _fmt_int_plain(balance)
 
     # استقامة صارمة داخل كتلة monospace: عرض عمودي المبلغ والرصيد يُحسب
     # ديناميكياً من أطول قيمة فعلية ومحاذاة يمين — ⟪ ⟫ مستقيمة كالمسطرة
@@ -369,7 +370,7 @@ def _render_customer_card(
         w_bal = max(len(x[2]) for x in rows_data)
         body = [
             f"• {dt}  [ {kind} ]  {signed.rjust(w_amt)}"
-            f"  ⟪ الرصيد: {bal_s.rjust(w_bal)} ⟫"
+            f"  ⟪ الرصيد: {bal_s.rjust(w_bal)} · الصافي: {net_plain} ⟫"
             for kind, signed, bal_s, dt in rows_data
         ]
         lines.append("```")
@@ -975,6 +976,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if any(w in low for w in ("اكبر", "أكبر", "ترتيب")) and not has_money:
         return await cmd_top(update, context)
 
+    # ── حذف حساب بالاسم — مثل دين/سداد: عرض الحساب ثم تأكيد/إلغاء ──
+    # (لا يُفعَّل إلا بصيغة مقصودة «حذف <الاسم>» — لا زر تحت البطاقة إطلاقاً)
+    if low.startswith("حذف ") and "لتر" not in low:
+        return await _request_delete_by_name(update, text[4:].strip())
+
     result = parse_message(text)
 
     if result.action == ACTION_BALANCE:
@@ -1450,21 +1456,8 @@ async def _show_balance(
             cust["id"],
         )
         await update.effective_message.reply_text(card)
-
-        # ── زر حذف الحساب (إن وجدت معاملات) ──
-        if ledger or has_fuel:
-            kb = [
-                [
-                    InlineKeyboardButton(
-                        "🗑️ حذف الحساب بالكامل",
-                        callback_data=f"{CALLBACK_DELETE_PREFIX}{cust['id']}",
-                    ),
-                ]
-            ]
-            await update.effective_message.reply_text(
-                "⚠️ خطر: حذف الحساب يُمسح كل البيانات نهائياً.",
-                reply_markup=InlineKeyboardMarkup(kb),
-            )
+        # ملاحظة أمان: لا زر حذف تحت البطاقة إطلاقاً — الحذف أصبح أمراً
+        # نصياً مقصوداً «حذف <الاسم>» مع تأكيد/إلغاء (يمنع الضغط الخاطئ).
     except Exception:  # noqa: BLE001
         logger.exception("فشل عرض الرصيد")
         await update.effective_message.reply_text("خطأ في جلب الرصيد. حاول مجدداً.")
@@ -2192,6 +2185,67 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     except Exception as exc:
         logger.exception("فشل عرض بطاقة العميل")
         await update.effective_message.reply_text(f"خطأ: {str(exc)}")
+    return ConversationHandler.END
+
+
+async def _request_delete_by_name(update: Update, name: str) -> int:
+    """«حذف <الاسم>» — يعرض بطاقة الحساب أولاً ثم تأكيد/إلغاء (للمالك فقط).
+
+    نمط مطابق لدين/سداد: المستخدم يرى ما سيحذفه بالأرقام قبل أي مسح،
+    والتأكيد النهائي يمر عبر نفس مسار delyes الموجود (تأكيد مزدوج أصلاً).
+    """
+    if not is_owner(update):
+        await _guard(update)
+        return ConversationHandler.END
+    name = (name or "").strip()
+    if not name:
+        await update.effective_message.reply_text(
+            "اكتب الاسم بعد كلمة حذف — مثال: حذف عبدو"
+        )
+        return ConversationHandler.END
+    try:
+        cust = db.find_customer(name)
+        if not cust:
+            await update.effective_message.reply_text(
+                f"لا يوجد حساب باسم «{_md(name)}» ليُحذف."
+            )
+            return ConversationHandler.END
+        balance = db.get_balance(cust["id"])
+        try:
+            fuel_m = db.get_fuel_balance(cust["id"], "mazot")
+            fuel_b = db.get_fuel_balance(cust["id"], "benzine")
+        except Exception:  # noqa: BLE001 — قاعدة قديمة بلا جدول الوقود
+            fuel_m = fuel_b = Decimal("0")
+        try:
+            ledger = db.get_ledger(cust["id"])
+        except Exception:  # noqa: BLE001
+            ledger = []
+        card = _render_customer_card(
+            cust["name"], balance, None, ledger, cust["id"]
+        )
+        fuel_note = ""
+        if fuel_m != 0 or fuel_b != 0:
+            fuel_note = (
+                f"\n⛽ مازوت: {_fmt_liters(fuel_m)} لتر"
+                f"  |  بنزين: {_fmt_liters(fuel_b)} لتر"
+            )
+        kb = [
+            [
+                InlineKeyboardButton(
+                    "⚠️ نعم، احذف نهائياً",
+                    callback_data=f"{CALLBACK_DELETE_PREFIX}{cust['id']}",
+                ),
+                InlineKeyboardButton("❌ إلغاء", callback_data="undo_cancel"),
+            ]
+        ]
+        await update.effective_message.reply_text(
+            f"{card}{fuel_note}\n\n"
+            "⚠️ الحذف نهائي بلا رجعة — راجع الأرقام أعلاه ثم اختر:",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("فشل طلب حذف الحساب بالاسم")
+        await update.effective_message.reply_text("خطأ في تجهيز الحذف. حاول مجدداً.")
     return ConversationHandler.END
 
 

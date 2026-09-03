@@ -990,7 +990,114 @@ def test_backup_cron_schedule_midnight_station_time():
     assert "api/backup.py" in config["functions"]
 
 
-def test_alert_endpoint_still_intact_alongside_backup():
+def test_card_shows_net_beside_running_balance():
+    """كل سطر يعرض الرصيد والصافي جنباً إلى جنب داخل ⟪ ⟫ كما طلب المالك."""
+    ledger = [
+        {"id": "t1", "amount": "7000", "tx_type": "debit",
+         "created_at": "2026-08-31T13:16:00+00:00"},
+        {"id": "t2", "amount": "-1800", "tx_type": "credit",
+         "created_at": "2026-08-31T13:47:00+00:00"},
+    ]
+    out = _card(ledger, "5200")
+    assert out.count("⟪ الرصيد:") == 2
+    assert out.count("· الصافي: 5,200 ⟫") == 2
+    assert "⚖️ صافي المطالبة النقدية: 5,200 ل.س" in out
+
+
+def test_card_has_no_delete_button_anymore():
+    """لا زر حذف تحت البطاقة — الحذف نصي مقصود فقط (يمنع الضغط الخاطئ)."""
+    ledger = [
+        {"id": "t1", "amount": "500", "tx_type": "debit",
+         "created_at": "2026-09-01T08:00:00+00:00"},
+    ]
+    out = _card(ledger, "500")
+    assert "🗑️" not in out
+    assert "حذف الحساب" not in out
+
+
+def test_delete_by_name_flow_shows_card_then_confirm_buttons():
+    """«حذف عبدو» = بطاقة الحساب بالأرقام أولاً + نعم/إلغاء (نمط دين/سداد)."""
+    import asyncio  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    class _Msg:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append((text, kw))
+
+    class _Usr:
+        id = settings.owner_telegram_id
+
+    class _Upd:
+        effective_message = _Msg()
+        effective_user = _Usr()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sdb, "find_customer",
+                        lambda name: {"id": "c1", "name": "عبدو"})
+    monkeypatch.setattr(sdb, "get_balance", lambda cid: botmod.Decimal("8000"))
+    monkeypatch.setattr(sdb, "get_fuel_balance", lambda cid, ft=None: botmod.Decimal("0"))
+    monkeypatch.setattr(
+        sdb, "get_ledger",
+        lambda cid: [{"id": "t1", "amount": "7000", "tx_type": "debit",
+                      "created_at": "2026-08-31T13:16:00+00:00"}],
+    )
+
+    upd = _Upd()
+    asyncio.run(botmod._request_delete_by_name(upd, "عبدو"))
+    text = upd.effective_message.sent[0][0]
+    kw = upd.effective_message.sent[0][1]
+    # يرى الحساب بالأرقام قبل الحذف
+    assert "بطاقة العميل: عبدو" in text
+    assert "8,000" in text
+    # زرا تأكيد/إلغاء موجودان — والمسار نحو تأكيد delyes الموجود
+    kb = kw["reply_markup"].inline_keyboard
+    labels = [b.text for row in kb for b in row]
+    callbacks = [b.callback_data for row in kb for b in row]
+    assert "⚠️ نعم، احذف نهائياً" in labels
+    assert "❌ إلغاء" in labels
+    assert callbacks[0].startswith("del:c1")
+    assert callbacks[1] == "undo_cancel"
+    monkeypatch.undo()
+
+
+def test_delete_by_name_rejects_non_owner():
+    """الحماية: غير المالك لا يحذف — رسالة حراسة بلا أي تأكيد."""
+    import asyncio  # noqa: PLC0415
+
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    class _Msg:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append((text, kw))
+
+    class _Usr:
+        id = 999999  # ليس المالك
+
+    class _Upd:
+        effective_message = _Msg()
+        effective_user = _Usr()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sdb, "find_customer",
+                        lambda name: {"id": "c1", "name": "عبدو"})
+
+    upd = _Upd()
+    asyncio.run(botmod._request_delete_by_name(upd, "عبدو"))
+    texts = [t for t, _ in upd.effective_message.sent]
+    assert any("مصرّح" in t or "صلاحية" in t for t in texts)
+    assert not any("بطاقة العميل" in t for t in texts)  # لم يعرض الحساب أصلاً
+    monkeypatch.undo()
+
+
     """الاستقلال الكامل: نقطة التنبيه الأصلية تعمل كما هي بجانب النسخ."""
     import api.alert as alert_mod  # noqa: PLC0415
 
