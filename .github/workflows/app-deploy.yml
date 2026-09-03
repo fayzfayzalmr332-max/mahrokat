@@ -32,28 +32,17 @@ jobs:
     name: نشر Vercel Production
     needs: tests
     runs-on: ubuntu-latest
+    # النشر ذكي: يعمل تلقائياً فور توفر أسرار Vercel، ويُتخطّى بتحذير دونها.
+    if: >-
+      secrets.VERCEL_TOKEN != '' &&
+      secrets.VERCEL_ORG_ID != '' &&
+      secrets.VERCEL_PROJECT_ID != ''
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: التحقق من أسرار Vercel
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
-          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-        run: |
-          MISSING=""
-          [ -z "$VERCEL_TOKEN" ] && MISSING="$MISSING VERCEL_TOKEN"
-          [ -z "$VERCEL_ORG_ID" ] && MISSING="$MISSING VERCEL_ORG_ID"
-          [ -z "$VERCEL_PROJECT_ID" ] && MISSING="$MISSING VERCEL_PROJECT_ID"
-          if [ -n "$MISSING" ]; then
-            echo "::error::الأسرار الناقصة:$MISSING"
-            echo "::error::أضفها من: Settings → Secrets and variables → Actions → New repository secret (وليس Variables)"
-            exit 1
-          fi
 
       - name: سحب إعدادات المشروع من Vercel
         run: npx --yes vercel@latest pull --yes --environment=production --token="$VERCEL_TOKEN"
@@ -75,3 +64,19 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+  vercel-pending:
+    name: "⏸️ تنبيه: نشر Vercel مؤجّل"
+    needs: tests
+    runs-on: ubuntu-latest
+    # يعمل فقط عند غياب أسرار Vercel — تحذير أصفر صريح بدل فشل أحمر.
+    if: >-
+      secrets.VERCEL_TOKEN == '' ||
+      secrets.VERCEL_ORG_ID == '' ||
+      secrets.VERCEL_PROJECT_ID == ''
+    steps:
+      - name: تحذير الأسرار الناقصة
+        run: |
+          echo "::warning::أسرار Vercel غير مضبوطة بعد — النشر مؤجّل حتى إضافتها."
+          echo "::warning::أضف VERCEL_TOKEN و VERCEL_ORG_ID و VERCEL_PROJECT_ID من Settings → Secrets and variables → Actions (كـ Secrets وليس Variables)"
+          echo "::warning::بعد الإضافة، أعِد تشغيل الـ workflow وسيبدأ النشر تلقائياً. الاختبارات نجحت."
