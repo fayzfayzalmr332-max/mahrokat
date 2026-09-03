@@ -306,8 +306,8 @@ def _render_customer_card(
     """
     sep = "────────────────────"
     lines = [
-        "⛽ محطة محروقات العمر",
-        f"بطاقة العميل — {name}",
+        "🏢 محطة محروقات العمر",
+        f"💳 بطاقة العميل — {name}",
         sep,
         f"💰 الرصيد النقدي: {_fmt_money_int(balance)}",
     ]
@@ -321,18 +321,29 @@ def _render_customer_card(
     lines.append(f"📋 العمليات ({len(ledger)}):")
     lines.append("")
 
-    body = []
-    running = Decimal("0.000")
-    # نحسب الرصيد التراكمي من الأقدم (ledger مرتب تصاعدياً من get_ledger)
+    # مصدر الحقيقة المزدوج: الرصيد التراكمي من view قاعدة البيانات
+    # (window sum على المبالغ الموقَّعة — صحيح محاسبياً حكماً)، مع مسار
+    # احتياطي محلي يجمّع المبالغ كما هي (دين +/سداد −) بلا أي قلب إشارة.
     balances_map: dict[str, Decimal] = {}
+    running = Decimal("0.000")
     for r in ledger:
         amt = to_decimal(r.get("amount") or 0)
-        if r.get("tx_type") == "debit":
-            running += amt
+        rb = r.get("running_balance")
+        if rb is not None:
+            running = to_decimal(rb)
         else:
-            running -= amt
+            running += amt
         balances_map[r.get("id", "")] = running
 
+    # تحصين التكامل: آخر رصيد تراكمي يجب أن يطابق الرصيد الصافي من get_balance.
+    # أي انحراف = خلل إشارات/بيانات يُسجَّل فوراً للمعالجة لا يُعرض للعميل بصمت.
+    if ledger and running != balance:
+        logger.error(
+            "انحراف تكامل ترصيد: العميل=%s التراكمي=%s الصافي=%s",
+            name, running, balance,
+        )
+
+    rows_data = []
     for idx, r in enumerate(ledger, 1):
         tx_type = r.get("tx_type", "")
         kind = "دين" if tx_type == "debit" else "سداد"
@@ -340,12 +351,30 @@ def _render_customer_card(
         abs_whole = abs(int(amt.to_integral_value(rounding="ROUND_FLOOR")))
         abs_fmt = _hi_num(f"{abs_whole:,}")
         signed = f"-{abs_fmt}" if tx_type == "debit" else f"+{abs_fmt}"
-        bal = balances_map.get(r.get("id", ""), Decimal("0.00"))
-        dt = _fmt_dt_compact(r.get("created_at"))
-        body.append(f"📅 {dt}")
-        body.append(f"#{_hi_num(str(idx))}   {kind}   {signed} ل.س   →   {_fmt_money_int(bal)}")
+        bal = balances_map.get(r.get("id", ""), Decimal("0.000"))
+        rows_data.append(
+            (
+                f"#{idx}",
+                kind,
+                f"{signed} ل.س",
+                _fmt_money_int(bal),
+                _fmt_dt_compact(r.get("created_at")),
+            )
+        )
 
-    if body:
+    # استقامة صارمة: عروض الأعمدة تُحسب ديناميكياً من أطول قيمة فعلية،
+    # والأرقام (مبلغ/رصيد) محاذاة يمين — فيستقيم الصف كالمسطرة مهما تفاوتت
+    # الخانات (8 مقابل 18,000) داخل كتلة monospace.
+    if rows_data:
+        w_num = max(len(x[0]) for x in rows_data)
+        w_kind = max(len(x[1]) for x in rows_data)
+        w_amt = max(len(x[2]) for x in rows_data)
+        w_bal = max(len(x[3]) for x in rows_data)
+        body = [
+            f"{num.ljust(w_num)}  {kind.ljust(w_kind)}  "
+            f"{amt_s.rjust(w_amt)}  →  {bal_s.rjust(w_bal)}   {dt}"
+            for num, kind, amt_s, bal_s, dt in rows_data
+        ]
         lines.append("```")
         lines.extend(body)
         lines.append("```")
