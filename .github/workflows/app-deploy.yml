@@ -45,8 +45,13 @@ jobs:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
         run: |
-          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_ORG_ID" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
-            echo "::error::أسرار Vercel غير مكتملة — أضف VERCEL_TOKEN و VERCEL_ORG_ID و VERCEL_PROJECT_ID من Settings → Secrets and variables → Actions"
+          MISSING=""
+          [ -z "$VERCEL_TOKEN" ] && MISSING="$MISSING VERCEL_TOKEN"
+          [ -z "$VERCEL_ORG_ID" ] && MISSING="$MISSING VERCEL_ORG_ID"
+          [ -z "$VERCEL_PROJECT_ID" ] && MISSING="$MISSING VERCEL_PROJECT_ID"
+          if [ -n "$MISSING" ]; then
+            echo "::error::الأسرار الناقصة:$MISSING"
+            echo "::error::أضفها من: Settings → Secrets and variables → Actions → New repository secret (وليس Variables)"
             exit 1
           fi
 
