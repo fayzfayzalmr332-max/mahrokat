@@ -1159,6 +1159,44 @@ def _find_duplicate(pending: dict, customer_id: str | None = None) -> dict | Non
     )
 
 
+def _settle_keyboard(customer_id: str) -> InlineKeyboardMarkup:
+    """زرّا التسوية التلقائية: حذف السجل أو الإبقاء عليه للأرشفة."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🗑️ نعم، احذف السجل",
+                    callback_data=f"{CALLBACK_SETTLE_CLEAR_PREFIX}{customer_id}",
+                ),
+                InlineKeyboardButton(
+                    "📋 لا، أبقِ السجل",
+                    callback_data=CALLBACK_SETTLE_KEEP,
+                ),
+            ]
+        ]
+    )
+
+
+def _account_fully_settled(customer_id: str) -> bool:
+    """هل الحساب مُصفّر بالكامل (النقد واللترات كلاهما صفر)؟
+
+    يُستدعى بعد أي «سداد» (نقداً أو لترات) ليقرر عرض رسالة التسوية.
+    قاعدة قديمة بلا جدول وقود تُعامَل كأن اللترات غير مطلوبة لإكمال
+    التصفير (النقد وحده مقياس التسوية في تلك الحالة).
+    """
+    try:
+        if db.get_balance(customer_id) != 0:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        mazot = db.get_fuel_balance(customer_id, "mazot")
+        benzine = db.get_fuel_balance(customer_id, "benzine")
+    except Exception:  # noqa: BLE001
+        return True
+    return mazot == 0 and benzine == 0
+
+
 async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """تنفيذ العملية المعلقة بعد تأكيد «نعم» — لا تُفقد العملية عند فشل مؤقت."""
     pending = context.user_data.get("pending_tx")
@@ -1235,6 +1273,18 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"_(حساب اللترات مستقل تماماً عن الرصيد النقدي)_",
                 parse_mode=ParseMode.MARKDOWN,
             )
+            # ── تسوية تلقائية: سداد لترات أوصل الحساب كله للصفر ──
+            if pending["entry_type"] == "credit" and _account_fully_settled(customer_id):
+                try:
+                    ledger = db.get_ledger(customer_id)
+                except Exception:  # noqa: BLE001
+                    ledger = []
+                if ledger:
+                    await update.effective_message.reply_text(
+                        "✅ لقد تم تسوية الحساب بشكل كامل.\n"
+                        "هل تريد حذف جميع العمليات السابقة؟",
+                        reply_markup=_settle_keyboard(customer_id),
+                    )
             context.user_data.pop("pending_tx", None)
             return ConversationHandler.END
 
@@ -1267,29 +1317,17 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode=ParseMode.MARKDOWN,
         )
 
-        # ── كشف التسوية التلقائية: إن أصبح الرصيد صفراً بعد سداد ──
-        if pending["action"] == ACTION_CREDIT and balance == 0:
+        # ── كشف التسوية التلقائية: أصبح الحساب كله صفراً بعد سداد ──
+        if pending["action"] == ACTION_CREDIT and _account_fully_settled(customer_id):
             try:
                 ledger = db.get_ledger(customer_id)
             except Exception:  # noqa: BLE001
                 ledger = []
             if ledger:
-                kb = [
-                    [
-                        InlineKeyboardButton(
-                            "🗑️ نعم، احذف السجل",
-                            callback_data=f"{CALLBACK_SETTLE_CLEAR_PREFIX}{customer_id}",
-                        ),
-                        InlineKeyboardButton(
-                            "📋 لا، أبقِ السجل",
-                            callback_data=CALLBACK_SETTLE_KEEP,
-                        ),
-                    ]
-                ]
                 await update.effective_message.reply_text(
                     "✅ لقد تم تسوية الحساب بشكل كامل.\n"
                     "هل تريد حذف جميع العمليات السابقة؟",
-                    reply_markup=InlineKeyboardMarkup(kb),
+                    reply_markup=_settle_keyboard(customer_id),
                 )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تنفيذ العملية")
@@ -1498,6 +1536,19 @@ async def _execute_pending_from_callback(
                 f"_(حساب اللترات مستقل تماماً عن الرصيد النقدي)_",
                 parse_mode=ParseMode.MARKDOWN,
             )
+            # ── تسوية تلقائية: سداد لترات أوصل الحساب كله للصفر ──
+            if pending["entry_type"] == "credit" and _account_fully_settled(customer_id):
+                try:
+                    ledger = db.get_ledger(customer_id)
+                except Exception:  # noqa: BLE001
+                    ledger = []
+                if ledger:
+                    await _safe_reply(
+                        query.message,
+                        "✅ لقد تم تسوية الحساب بشكل كامل.\n"
+                        "هل تريد حذف جميع العمليات السابقة؟",
+                        reply_markup=_settle_keyboard(customer_id),
+                    )
             context.user_data.pop("pending_tx", None)
             return ConversationHandler.END
 
@@ -1527,6 +1578,19 @@ async def _execute_pending_from_callback(
             f"الرصيد: {_fmt_money(balance)}",
             parse_mode=ParseMode.MARKDOWN,
         )
+        # ── كشف التسوية التلقائية: أصبح الحساب كله صفراً بعد سداد ──
+        if pending["action"] == ACTION_CREDIT and _account_fully_settled(customer_id):
+            try:
+                ledger = db.get_ledger(customer_id)
+            except Exception:  # noqa: BLE001
+                ledger = []
+            if ledger:
+                await _safe_reply(
+                    query.message,
+                    "✅ لقد تم تسوية الحساب بشكل كامل.\n"
+                    "هل تريد حذف جميع العمليات السابقة؟",
+                    reply_markup=_settle_keyboard(customer_id),
+                )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تنفيذ العملية عند الضغط")
         await _safe_edit(

@@ -537,13 +537,22 @@ class Database:
         self._req("DELETE", "transactions", q)
 
     def delete_customer(self, customer_id: str, confirm: bool = False) -> None:
-        """حذف عميل وكل معاملاته — يتطلب confirm=True صريحاً كحماية."""
+        """حذف عميل وكل معاملاته — يتطلب confirm=True صريحاً كحماية.
+
+        الحذف نهائي وفوري: يُمسح كل المعاملات النقدية وحركات الوقود
+        وبيانات العميل من القاعدة دون أي نسخة احتياطية أو أرشفة.
+        """
         if not confirm:
             raise RuntimeError(
                 "حماية: delete_customer يتطلب confirm=True — عملية خطيرة لا تُنفّذ تلقائياً"
             )
         qtx = urllib.parse.urlencode({"customer_id": f"eq.{customer_id}"})
         self._req("DELETE", "transactions", qtx)
+        try:
+            qf = urllib.parse.urlencode({"customer_id": f"eq.{customer_id}"})
+            self._req("DELETE", "fuel_ledger", qf)
+        except RuntimeError:  # noqa: BLE001 — قاعدة قديمة بلا جدول الوقود
+            logger.info("لا جدول fuel_ledger عند حذف العميل %s — نكمل", customer_id)
         q = urllib.parse.urlencode({"id": f"eq.{customer_id}"})
         self._req("DELETE", "customers", q)
 

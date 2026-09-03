@@ -573,3 +573,93 @@ def test_normalize_keeps_decimal_amounts_intact():
 
 
 
+# ═══════════════════════════════════════════════════════════════
+# 7) الحذف النهائي الشامل + التسوية التلقائية
+# ═══════════════════════════════════════════════════════════════
+def test_delete_customer_removes_fuel_ledger_too(monkeypatch):
+    """حذف الحساب النهائي يمسح المعاملات + حركات الوقود + العميل نفسه.
+
+    انحدار: كان delete_customer يترك row في fuel_ledger — «أثر متبقّي»
+    في القاعدة. الشرط الأساسي للمواصفة: حذف فوري ونهائي بلا أثر.
+    """
+    from app.services import Database  # noqa: PLC0415
+
+    stub = _ReqStub()
+    inst = _db()
+    inst._req = stub
+    inst.delete_customer("c1", confirm=True)
+
+    calls = [(m, p) for m, p, _, _, _ in stub.calls]
+    # الترتيب الحاسم: معاملات → وقود → عميل
+    assert ("DELETE", "transactions") in calls
+    assert ("DELETE", "fuel_ledger") in calls
+    assert ("DELETE", "customers") in calls
+    assert calls[0] == ("DELETE", "transactions")
+    assert calls[-1] == ("DELETE", "customers")
+
+
+def test_delete_customer_survives_old_db_without_fuel_table():
+    """قاعدة قديمة بلا جدول fuel_ledger → الحذف النهائي لا يكسر."""
+
+    def _boom_inner(method, path, query="", payload=None, headers=None):
+        if path == "fuel_ledger":
+            raise RuntimeError("جدول fuel_ledger غير موجود — شغّل الترحيل 006")
+        return 200, []
+
+    inst = _db()
+    inst._req = _boom_inner
+    inst.delete_customer("c1", confirm=True)  # يجب ألا يرمي
+
+
+def test_account_fully_settled_requires_all_zero(monkeypatch):
+    """«التسوية الكاملة» = النقد صفر + اللترات كلها صفر (مازوت وبنزين)."""
+    from app.services import db as sdb  # noqa: PLC0415
+    from app.bot import _account_fully_settled  # noqa: PLC0415
+
+    state = {"cash": "0.00", "mazot": "0.000", "benzine": "0.000"}
+
+    monkeypatch.setattr(sdb, "get_balance", lambda cid: Decimal(state["cash"]))
+    monkeypatch.setattr(
+        sdb, "get_fuel_balance", lambda cid, ft=None: Decimal(state[ft])
+    )
+
+    # كل شيء صفر → تسوية كاملة
+    assert _account_fully_settled("c1") is True
+    # نقد غير صفري → لا تسوية
+    state["cash"] = "500.00"
+    assert _account_fully_settled("c1") is False
+    state["cash"] = "0.00"
+    # لترات غير صفرية → لا تسوية
+    state["mazot"] = "1.000"
+    assert _account_fully_settled("c1") is False
+    state["mazot"] = "0.000"
+    # بنزين غير صفري → لا تسوية
+    state["benzine"] = "3.500"
+    assert _account_fully_settled("c1") is False
+
+
+def test_settlement_keyboard_buttons_register():
+    """زرّا التسوية (احذف السجل / أبقِه) مطابقان لنمط on_nav_callback."""
+    import re  # noqa: PLC0415
+
+    from app.bot import build_application  # noqa: PLC0415
+    from app.config import settings  # noqa: PLC0415
+
+    app = build_application(settings)
+    patterns = []
+    for hs in app.handlers.values():
+        for h in hs:
+            cb = getattr(h, "callback", None)
+            pat = getattr(h, "pattern", None)
+            if cb is not None and callable(cb) and getattr(cb, "__name__", "") == "on_nav_callback":
+                patterns.append(pat)
+    assert patterns, "معالج on_nav_callback غير مسجّل"
+    for data in (
+        "settleyes:3f2b8c1e-9a1d-4c5e-b6f0-123456789abc",
+        "settlekeep",
+        "del:3f2b8c1e-9a1d-4c5e-b6f0-123456789abc",
+        "delyes:3f2b8c1e-9a1d-4c5e-b6f0-123456789abc",
+    ):
+        assert any(re.match(p, data) for p in patterns), (
+            f"الزر {data} لا يطابق النمط (زر ميت!)"
+        )
