@@ -591,35 +591,6 @@ def _cash_card_rows(ledger: list[dict]) -> tuple[list[list[str]], list[str]]:
     return rows, []
 
 
-def _fuel_card_rows(activity: list[dict]) -> tuple[list[list[str]], list[str]]:
-    """صفوف جدول اللترات: التاريخ، العملية، اللترات، الرصيد بعد كل عملية.
-
-    يتحمّل قواعد قديمة بلا View رصيد تراكمي: يحسب محلياً بدقة Decimal من
-    liters الموقَّعة (سحب «+» / إيداع «−») مع تصحيح الإشارة من entry_type،
-    ويُلحق الإجماليات بصف footer تُعرض ختام السجل.
-    """
-    rows: list[list[str]] = []
-    running = Decimal("0.000")
-    for r in activity:
-        liters = Decimal(str(r.get("liters") or 0))
-        etype = r.get("entry_type")
-        if etype == "credit" and liters > 0:
-            liters = -liters
-        elif etype == "debit" and liters < 0:
-            liters = abs(liters)
-        running += liters
-        rows.append(
-            [
-                _fmt_dt_compact(r.get("created_at")),
-                "سحب" if liters > 0 else "إيداع",
-                _fmt_liters(liters),
-                _fmt_liters(running),
-            ]
-        )
-    footer = [f"⚖️ صافي اللترات: {_fmt_liters(running)} لتر"] if rows else []
-    return rows, footer
-
-
 async def _reply_card(update: Update, pages: list[list[str]]) -> None:
     """مرسل البطاقة المُصفَّق: كل صفحة كتلة كود مكتملة القفل (نسخ بضغطة واحدة).
 
