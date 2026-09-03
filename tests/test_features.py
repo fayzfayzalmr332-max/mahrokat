@@ -866,7 +866,141 @@ def test_show_balance_professional_output(monkeypatch):
     assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
 
 
-# ── لوحة الردود الدائمة (أيقونة المربعات) ─────────────────────
+import json
+
+import pytest
+
+
+# ── النسخ الاحتياطي اليومي التلقائي (api/backup.py) ──────────
+def test_backup_endpoint_rejects_unauthorized():
+    """حارس الأمان: طلب بلا هوية cron → 401 فوراً (لا وصول للبيانات)."""
+    from flask.testing import FlaskClient  # noqa: PLC0415
+
+    import api.backup as backup_mod  # noqa: PLC0415
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("CRON_SECRET", "s3cret")  # فرض وضع السرّ
+    client = FlaskClient(backup_mod.app, backup_mod.app.response_class)
+    # بلا ترويسة → رفض
+    assert client.get("/api/backup").status_code == 401
+    # ترويسة خاطئة → رفض
+    r = client.get("/api/backup", headers={"Authorization": "Bearer wrong"})
+    assert r.status_code == 401
+    monkeypatch.undo()
+
+
+def test_backup_endpoint_accepts_valid_secret():
+    """السرّ الصحيح يمر الحارس — ويُنفَّذ الإرسال (بستُب للبوت)."""
+    from flask.testing import FlaskClient  # noqa: PLC0415
+
+    import api.backup as backup_mod  # noqa: PLC0415
+    import api.runtime as rt  # noqa: PLC0415
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("CRON_SECRET", "s3cret")
+
+    captured = {}
+
+    class _FakeBot:
+        async def send_document(self, **kw):
+            captured.update(kw)
+
+    class _FakeApp:
+        bot = _FakeBot()
+
+        async def initialize(self):
+            pass
+
+    monkeypatch.setattr(backup_mod, "get_application", lambda: _FakeApp())
+
+    # قاعدة مقنَّعة: list_all_data مستوردة داخل _run_backup من app.services
+    from app import services as services_mod  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        services_mod.db, "list_all_data",
+        lambda: {"customers": [], "transactions": [],
+                 "account_entries": [], "fuel_ledger": []},
+    )
+    monkeypatch.setattr(rt, "run_coro", lambda coro: coro.close())
+
+    client = FlaskClient(backup_mod.app, backup_mod.app.response_class)
+    r = client.get("/api/backup", headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 200
+    assert r.get_json()["ok"] is True
+    # الإرسال تم للمالك بملف JSON باسم يومي ثابت
+    assert captured["chat_id"] == int(backup_mod.settings.owner_telegram_id)
+    assert captured["filename"].startswith("fuelstation_backup_")
+    assert captured["filename"].endswith(".json")
+    assert "💾 النسخ الاحتياطي اليومي" in captured["caption"]
+    monkeypatch.undo()
+
+
+def test_backup_snapshot_includes_fuel_and_settings():
+    """اللقطة الكاملة v3: تشمل دفتر اللترات والإعدادات — بأمان على قاعدة قديمة."""
+    from app.services import Database  # noqa: PLC0415
+
+    db = Database()
+
+    def fake_req(method, path, params=""):
+        rows = {
+            "customers": [{"id": "c1"}],
+            "transactions": [{"id": "t1"}],
+            "account_entries": [],
+            "fuel_ledger": [{"id": "f1", "liters": "12.5"}],
+            "app_settings": [{"key": "k", "value": "v"}],
+        }
+        if method == "GET" and path in rows:
+            return None, rows[path]
+        raise RuntimeError("unexpected")
+
+    db._req = fake_req  # noqa: SLF001 — اختبار مباشر
+    snap = db.list_all_data()
+    assert snap["version"] == 3
+    assert snap["fuel_ledger"] == [{"id": "f1", "liters": "12.5"}]
+    assert snap["app_settings"] == [{"key": "k", "value": "v"}]
+
+
+def test_backup_snapshot_survives_missing_fuel_table():
+    """قاعدة قديمة بلا جدول fuel_ledger → اللقطة تعيد [] ولا تنكسر أبداً."""
+    from app.services import Database  # noqa: PLC0415
+
+    db = Database()
+
+    def fake_req(method, path, params=""):
+        if method == "GET" and path == "fuel_ledger":
+            raise RuntimeError("relation does not exist")
+        if method == "GET":
+            return None, []
+        raise RuntimeError("unexpected")
+
+    db._req = fake_req  # noqa: SLF001
+    snap = db.list_all_data()
+    assert snap["fuel_ledger"] == [] and snap["version"] == 3
+
+
+def test_backup_cron_schedule_midnight_station_time():
+    """الجدولة: 21:00 UTC = 12 منتصف الليل بتوقيت المحطة (+3) — نقطة /api/backup."""
+    with open("vercel.json", encoding="utf-8") as f:
+        config = json.load(f)
+    crons = {c["path"]: c["schedule"] for c in config["crons"]}
+    assert crons.get("/api/backup") == "0 21 * * *"
+    # التنبيه الموجود لم يُمس
+    assert crons.get("/api/alert") == "0 9 * * *"
+    # الدالة الثالثة مسجلة للنشر
+    assert "api/backup.py" in config["functions"]
+
+
+def test_alert_endpoint_still_intact_alongside_backup():
+    """الاستقلال الكامل: نقطة التنبيه الأصلية تعمل كما هي بجانب النسخ."""
+    import api.alert as alert_mod  # noqa: PLC0415
+
+    # داخل سياق طلب: بلا سرّ ولا ترويسة → رفض (سلوك أصلي سليم)
+    with alert_mod.app.test_request_context("/api/alert"):
+        allowed, _ = alert_mod._is_authorized_cron()
+        assert allowed is False
+    assert hasattr(alert_mod, "run_alert")
+    assert hasattr(alert_mod, "_run_alert")
+
 def test_reply_keyboard_persistent_config():
     """اللوحة الدائمة: is_persistent + resize — أيقونة قابلة للطي/التوسيع."""
     from telegram import ReplyKeyboardMarkup  # noqa: PLC0415

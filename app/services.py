@@ -636,7 +636,7 @@ class Database:
 
     # ── النسخ الاحتياطي والاستعادة ──────────────────────────
     def list_all_data(self) -> dict:
-        """لقطة كاملة للنسخ الاحتياطي: عملاء + معاملات + قيود المحاسبي."""
+        """لقطة كاملة للنسخ الاحتياطي: عملاء + معاملات + قيود + لترات + إعدادات."""
         _, customers = self._req(
             "GET",
             "customers",
@@ -655,11 +655,27 @@ class Database:
             )
         except RuntimeError:  # noqa: BLE001
             entries = []
+        # دفتر اللترات (ترحيل 006): أُدرج بأمان — قاعدة قديمة بلا الجدول تعيد []
+        try:
+            _, fuel = self._req(
+                "GET",
+                "fuel_ledger",
+                "select=id,customer_id,fuel_type,entry_type,liters::text,created_at,external_ref",
+            )
+        except RuntimeError:  # noqa: BLE001
+            fuel = []
+        # الإعدادات الديناميكية (التنبيهات، التوقيت) — تُستعاد مع النسخة
+        try:
+            _, settings_rows = self._req("GET", "app_settings", "select=key,value")
+        except RuntimeError:  # noqa: BLE001
+            settings_rows = []
         return {
             "customers": customers,
             "transactions": txs,
             "account_entries": entries,
-            "version": 2,
+            "fuel_ledger": fuel,
+            "app_settings": settings_rows,
+            "version": 3,
         }
 
     def restore_snapshot(self, data: dict) -> dict:

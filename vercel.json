@@ -2,9 +2,11 @@
   "version": 2,
   "functions": {
     "api/webhook.py": { "memory": 1024, "maxDuration": 25 },
-    "api/alert.py": { "memory": 1024, "maxDuration": 25 }
+    "api/alert.py": { "memory": 1024, "maxDuration": 25 },
+    "api/backup.py": { "memory": 1024, "maxDuration": 25 }
   },
   "crons": [
-    { "path": "/api/alert", "schedule": "0 9 * * *" }
+    { "path": "/api/alert", "schedule": "0 9 * * *" },
+    { "path": "/api/backup", "schedule": "0 21 * * *" }
   ]
 }
