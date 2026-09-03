@@ -220,6 +220,14 @@ def _fmt_money_int(value) -> str:
     return f"{sign}{_hi_num(formatted)} ل.س"
 
 
+def _fmt_int_plain(value) -> str:
+    """رقم صحيح مُجمّع بلا عملة — لعمود الرصيد داخل ⟪ ⟫ («7,200»)."""
+    d = to_decimal(value)
+    sign = "-" if d < 0 else ""
+    whole = abs(int(d.to_integral_value(rounding="ROUND_FLOOR")))
+    return f"{sign}{_hi_num(f'{whole:,}')}"
+
+
 def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) -> str:
     """كشف حساب لترات موحّد — تنسيق سطر واحد لكل عملية بترقيم تسلسلي.
 
@@ -285,45 +293,38 @@ def _render_customer_card(
     fuel_balances: dict[str, Decimal] | None,
     ledger: list[dict],
     cust_id: str,
+    now: datetime | None = None,
 ) -> str:
-    """بطاقة عميل موحّدة: نقدي + لترات + سجل بعمليات مرقّمة وتواريخ.
+    """بطاقة العميل بالصيغة المعتمدة النهائية (الصيغة الحرفية من المالك).
 
-    الصيغة:
-        ⛽ محطة محروقات العمر
-        بطاقة العميل — [اسم العميل]
-        ────────────────────
-        💰 الرصيد النقدي: [X,000] ل.س
-        ⛽ مازوت: [X] لتر  |  بنزين: [X] لتر
-        ────────────────────
-
-        📋 العمليات (N):
-        [كتلة monospace]
-        📅 DD/MM/YYYY
-        #1   دين/سداد   [+/-X]   →   [الرصيد]
-        ...
-        ────────────────────
-        ⚖️ الرصيد الصافي: [X,000] ل.س
+    المعادلة المحاسبية الصارمة: الرصيد التراكمي = السابق + الدين - السداد.
+    المبالغ مخزَّنة موقَّعة (دين +/سداد −) فالتجميع: running += amt دائماً،
+    والعرض: دين «+» وسداد «−» بأرقام صحيحة بلا كسور (.00 محذوف نهائياً).
     """
-    sep = "────────────────────"
+    sep = "══════════════════════════════"
+    if now is None:
+        now = datetime.now(timezone(timedelta(hours=env_settings.timezone_offset)))
+    h12 = now.hour % 12 or 12
+    ampm = "ص" if now.hour < 12 else "م"
+    stamp = f"{now.day:02d}/{now.month:02d}/{now.year} · {h12:02d}:{now.minute:02d} {ampm}"
+
     lines = [
         "🏢 محطة محروقات العمر",
-        f"💳 بطاقة العميل — {name}",
+        f"💳 بطاقة العميل: {name}",
+        f"📅 تاريخ الجرد: {stamp}",
         sep,
-        f"💰 الرصيد النقدي: {_fmt_money_int(balance)}",
+        f"💰 الرصيد النقدي الحالي: {_fmt_money_int(balance)}",
     ]
     if fuel_balances and (fuel_balances.get("mazot", 0) != 0 or fuel_balances.get("benzine", 0) != 0):
         lines.append(
             f"⛽ مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
             f"  |  بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر"
         )
-    lines.append(sep)
-    lines.append("")
-    lines.append(f"📋 العمليات ({len(ledger)}):")
-    lines.append("")
+    lines += [sep, "", "📊 سجل العمليات المالي المصحح:", ""]
 
-    # مصدر الحقيقة المزدوج: الرصيد التراكمي من view قاعدة البيانات
-    # (window sum على المبالغ الموقَّعة — صحيح محاسبياً حكماً)، مع مسار
-    # احتياطي محلي يجمّع المبالغ كما هي (دين +/سداد −) بلا أي قلب إشارة.
+    # مصدر الحقيقة: running_balance من v_customer_ledger حكماً (SUM موقَّع
+    # في SQL — مستحيل أن يخالف المحاسبة)، والاحتياطي: running += amt
+    # (المبالغ موقَّعة أصلاً — لا قلب إشارة إطلاقاً).
     balances_map: dict[str, Decimal] = {}
     running = Decimal("0.000")
     for r in ledger:
@@ -335,8 +336,7 @@ def _render_customer_card(
             running += amt
         balances_map[r.get("id", "")] = running
 
-    # تحصين التكامل: آخر رصيد تراكمي يجب أن يطابق الرصيد الصافي من get_balance.
-    # أي انحراف = خلل إشارات/بيانات يُسجَّل فوراً للمعالجة لا يُعرض للعميل بصمت.
+    # حارس التكامل: أي انحراف بين آخر تراكمي والصافي يُسجَّل error فوراً.
     if ledger and running != balance:
         logger.error(
             "انحراف تكامل ترصيد: العميل=%s التراكمي=%s الصافي=%s",
@@ -344,36 +344,33 @@ def _render_customer_card(
         )
 
     rows_data = []
-    for idx, r in enumerate(ledger, 1):
+    for r in ledger:
         tx_type = r.get("tx_type", "")
-        kind = "دين" if tx_type == "debit" else "سداد"
+        kind = "ديــن" if tx_type == "debit" else "سداد"
         amt = to_decimal(r.get("amount") or 0)
         abs_whole = abs(int(amt.to_integral_value(rounding="ROUND_FLOOR")))
         abs_fmt = _hi_num(f"{abs_whole:,}")
-        signed = f"-{abs_fmt}" if tx_type == "debit" else f"+{abs_fmt}"
+        signed = f"+{abs_fmt}" if tx_type == "debit" else f"-{abs_fmt}"
         bal = balances_map.get(r.get("id", ""), Decimal("0.000"))
         rows_data.append(
             (
-                f"#{idx}",
                 kind,
-                f"{signed} ل.س",
-                _fmt_money_int(bal),
+                signed,
+                _fmt_int_plain(bal),
                 _fmt_dt_compact(r.get("created_at")),
             )
         )
 
-    # استقامة صارمة: عروض الأعمدة تُحسب ديناميكياً من أطول قيمة فعلية،
-    # والأرقام (مبلغ/رصيد) محاذاة يمين — فيستقيم الصف كالمسطرة مهما تفاوتت
-    # الخانات (8 مقابل 18,000) داخل كتلة monospace.
+    # استقامة صارمة داخل كتلة monospace: عرض عمودي المبلغ والرصيد يُحسب
+    # ديناميكياً من أطول قيمة فعلية ومحاذاة يمين — ⟪ ⟫ مستقيمة كالمسطرة
+    # مهما تفاوتت الخانات (8 مقابل 18,000) ولا سطر ينكسر.
     if rows_data:
-        w_num = max(len(x[0]) for x in rows_data)
-        w_kind = max(len(x[1]) for x in rows_data)
-        w_amt = max(len(x[2]) for x in rows_data)
-        w_bal = max(len(x[3]) for x in rows_data)
+        w_amt = max(len(x[1]) for x in rows_data)
+        w_bal = max(len(x[2]) for x in rows_data)
         body = [
-            f"{num.ljust(w_num)}  {kind.ljust(w_kind)}  "
-            f"{amt_s.rjust(w_amt)}  →  {bal_s.rjust(w_bal)}   {dt}"
-            for num, kind, amt_s, bal_s, dt in rows_data
+            f"• {dt}  [ {kind} ]  {signed.rjust(w_amt)}"
+            f"  ⟪ الرصيد: {bal_s.rjust(w_bal)} ⟫"
+            for kind, signed, bal_s, dt in rows_data
         ]
         lines.append("```")
         lines.extend(body)
@@ -381,7 +378,8 @@ def _render_customer_card(
 
     lines += [
         sep,
-        f"⚖️ الرصيد الصافي: {_fmt_money_int(balance)}",
+        f"⚖️ صافي المطالبة النقدية: {_fmt_money_int(balance)}",
+        "✨ شكراً لثقتكم وموقعكم في محطة العمر، يسعدنا دائماً خدمتكم.",
     ]
     return "\n".join(lines)
 

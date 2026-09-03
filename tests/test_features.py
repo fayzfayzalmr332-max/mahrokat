@@ -502,16 +502,18 @@ def test_fmt_dt_zero_pads_single_digit_day_month_hour():
 def _card(ledger, balance, fuel=None):
     import app.bot as botmod  # noqa: PLC0415
 
-    return botmod._render_customer_card(
-        "عبدو الجداح", botmod.Decimal(balance), fuel, ledger, "c1"
+    out = botmod._render_customer_card(
+        "عبدو الجداح", botmod.Decimal(balance), fuel, ledger, "c1",
+        now=botmod.datetime(2026, 9, 3, 7, 46),
     )
+    return out
 
 
 def test_card_running_balance_sign_inversion_regression():
-    """سيناريو عبدو الجداح: دين يخزَّن موجباً وسداد سالباً — السداد يطرح لا يجمع.
+    """سيناريو عبدو الجداح بالصيغة المعتمدة: الدين + والسداد − والتراكمي صحيح.
 
-    الكارثة السابقة: running -= amt مع سداد مخزَّن (-1800) كان يضيف بدل الطرح
-    فقفز التراكمي إلى 26,000 بينما الصافي 8,000. هذا الاختبار يمنع تكرارها.
+    الكارثة السابقة: قلب الإشارة جعل السداد يُجمع فقفز التراكمي إلى 26,000
+    بينما الصافي 8,000. هذا الاختبار يمنع تكرارها نهائياً.
     """
     ledger = [
         {"id": "t1", "amount": "7000", "tx_type": "debit",
@@ -523,62 +525,71 @@ def test_card_running_balance_sign_inversion_regression():
         {"id": "t4", "amount": "-7200", "tx_type": "credit",
          "created_at": "2026-08-31T18:05:00+00:00"},
         {"id": "t5", "amount": "100", "tx_type": "debit",
-         "created_at": "2026-09-01T08:00:00+00:00"},
+         "created_at": "2026-09-02T08:00:00+00:00"},
         {"id": "t6", "amount": "7900", "tx_type": "debit",
-         "created_at": "2026-09-01T09:00:00+00:00"},
+         "created_at": "2026-09-02T09:00:00+00:00"},
     ]
     out = _card(ledger, "8000")
     # التسلسل الصحيح: 7,000 → 9,000 → 7,200 → 0 → 100 → 8,000
-    assert "→" in out
-    for expected in ("7,000", "9,000", "7,200", "0", "100", "8,000"):
+    for expected in ("7,000", "9,000", "7,200", "100", "8,000"):
         assert expected in out
-    # القفزة الكارثية 26,000 ممنوعة نهائياً
+    # ستة أسطر عمليات، وصف التصفير حاضر (الرصيد 0 محاذى يميناً داخل ⟪ ⟫)
+    assert out.count("⟪ الرصيد:") == 6
+    assert "0 ⟫" in out
+    # القفزة الكارثية ممنوعة نهائياً
     assert "26,000" not in out
     assert "10,800" not in out and "18,000" not in out and "18,100" not in out
-    # الرصيد الصافي مطابق لآخر تراكمي (تكامل البيانات)
-    assert out.count("8,000") >= 2  # آخر سجل + السطر الختامي
-    assert "⚖️ الرصيد الصافي: 8,000" in out
+    # الصيغة المعتمدة حرفياً
+    assert "🏢 محطة محروقات العمر" in out
+    assert "💳 بطاقة العميل: عبدو الجداح" in out
+    assert "📅 تاريخ الجرد: " in out
+    assert "💰 الرصيد النقدي الحالي: 8,000 ل.س" in out
+    assert "📊 سجل العمليات المالي المصحح" in out
+    assert "⚖️ صافي المطالبة النقدية: 8,000 ل.س" in out
+    assert "✨ شكراً لثقتكم وموقعكم في محطة العمر" in out
+    # إشارات العرض: دين + وسداد − (المعادلة: سابق + دين - سداد)
+    assert "+7,000" in out and "+2,000" in out
+    assert "-1,800" in out and "-7,200" in out
 
 
-def test_card_prefers_db_running_balance_when_present():
-    """عند توفر running_balance من view القاعدة يُعتمد حكماً بلا إعادة حساب."""
+def test_card_no_decimal_zeros_and_db_balance_priority():
+    """لا أصفار كسور (.00) في المبالغ النقدية + أولوية running_balance للقاعدة."""
     ledger = [
         {"id": "t1", "amount": "5000", "tx_type": "debit",
          "created_at": "2026-09-01T08:00:00+00:00",
-         "running_balance": "5000"},
+         "running_balance": "5000.00"},
         {"id": "t2", "amount": "-2000", "tx_type": "credit",
          "created_at": "2026-09-01T09:00:00+00:00",
-         "running_balance": "3000"},
+         "running_balance": "3000.00"},
     ]
-    out = _card(ledger, "3000")
+    out = _card(ledger, "3000.00")
     assert "5,000" in out and "3,000" in out
-    assert "⚖️ الرصيد الصافي: 3,000" in out
+    assert ".00" not in out.replace("3000.00", "")  # كسور محذوفة من العرض
+    assert "⚖️ صافي المطالبة النقدية: 3,000 ل.س" in out
 
 
 def test_card_columns_strictly_aligned_dynamic_padding():
-    """استقامة صارمة: أعمدة المبلغ/الرصيد محاذاة يمين بعرض ديناميكي موحّد.
+    """التحقق الصارم من بيئة العرض (Telegram Render Check): ⟪ ⟫ مستقيمة.
 
-    تفاوت الخانات (8 مقابل 18,000) يجب ألا يعرّج السطور — موضع السهم
-    «→» موحد في كل صف، وموضع نهاية عمود الرصيد موحد أيضاً.
+    تفاوت الخانات (100 مقابل 18,000) يجب ألا يعرّج السطور: موضع ⟪
+    ونهاية عمود الرصيد موحّدان في كل صفوف كتلة monospace.
     """
     ledger = [
-        {"id": "t1", "amount": "8", "tx_type": "debit",
+        {"id": "t1", "amount": "100", "tx_type": "debit",
          "created_at": "2026-09-01T08:00:00+00:00"},
         {"id": "t2", "amount": "18000", "tx_type": "debit",
          "created_at": "2026-09-01T09:00:00+00:00"},
     ]
-    out = _card(ledger, "18008")
-    body = [l for l in out.splitlines() if "→" in l]
+    out = _card(ledger, "18100")
+    body = [l for l in out.splitlines() if "⟪" in l]
     assert len(body) == 2
-    # موضع السهم موحّد في كل السطور (استقامة عمود المبلغ)
-    assert {l.index("→") for l in body} == {body[0].index("→")}
-    # نهاية عمود الرصيد موحّدة: التاريخ يبدأ من نفس العمود في كل سطر
-    assert {l.rfind("/") for l in body} == {body[0].rfind("/")}
-    # 📅 محذوفة نهائياً من الأسطر الداخلية
-    assert "📅" not in out
-    # أيقونات الترويسة الجديدة
-    assert "🏢 محطة محروقات العمر" in out
-    assert "💳 بطاقة العميل — عبدو الجداح" in out
+    # موضع ⟪ موحّد في كل السطور (عمود المبلغ مستقيم)
+    assert {l.index("⟪") for l in body} == {body[0].index("⟪")}
+    # نهاية عمود الرصيد موحّدة: ⟫ الختامي بنفس العمود
+    assert {l.index("⟫") for l in body} == {body[0].index("⟫")}
+    # فواصل ═ متناسقة العرض في كل مواضعها
+    seps = {l for l in out.splitlines() if set(l) == {"═"}}
+    assert len(seps) == 1  # طول واحد فقط لكل الفواصل
 
 # ── كشف الحساب المالي الموحّد (_render_financial_statement) ──
 def _stmt(ledger, balance, currency="ل.س", now=(2026, 9, 1, 12, 0)):
@@ -832,7 +843,7 @@ def test_show_balance_professional_output(monkeypatch):
         sdb,
         "get_activity",
         lambda cid, limit=5: [
-            {"amount": "-7200", "tx_type": "credit", "note": None,
+            {"amount": "-7000", "tx_type": "credit", "note": None,
              "created_at": "2026-08-31T18:05:00+00:00"},
             {"amount": "7000", "tx_type": "debit", "note": None,
              "created_at": "2026-08-31T13:16:00+00:00"},
@@ -848,8 +859,8 @@ def test_show_balance_professional_output(monkeypatch):
     assert "⛽" not in text or "لتر" not in text  # صفر لترات → لا قسم وقود (لا زحام)
     assert "عبدو" in text
     assert "0 ل.س" in text
-    # الحركات مصنّفة بالنوع
-    assert "سداد" in text and "دين" in text
+    # الحركات مصنّفة بالنوع (الصيغة المعتمدة: ديــن بالتطويل)
+    assert "سداد" in text and "ديــن" in text
     # تاريخ رقمي كامل مبطّن (توقيت +3: 18:05 UTC → 21:05، 13:16 UTC → 16:16)
     assert "31/08/2026" in text
     assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
