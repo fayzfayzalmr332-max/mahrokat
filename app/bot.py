@@ -1177,6 +1177,12 @@ def _settle_keyboard(customer_id: str) -> InlineKeyboardMarkup:
     )
 
 
+_SETTLE_MSG = (
+    "✅ لقد تم تسوية الحساب بشكل كامل.\n"
+    "هل تريد حذف جميع العمليات السابقة؟"
+)
+
+
 def _account_fully_settled(customer_id: str) -> bool:
     """هل الحساب مُصفّر بالكامل (النقد واللترات كلاهما صفر)؟
 
@@ -1195,6 +1201,44 @@ def _account_fully_settled(customer_id: str) -> bool:
     except Exception:  # noqa: BLE001
         return True
     return mazot == 0 and benzine == 0
+
+
+async def _prompt_auto_settlement(
+    context: ContextTypes.DEFAULT_TYPE,
+    customer_id: str,
+    *,
+    query=None,
+    message=None,
+) -> None:
+    """المحرّك الوحيد لرسالة التسوية التلقائية — يُستدعى EVENT-DRIVEN فقط.
+
+    هذه الدالة هي نقطة الدخول الوحيدة لإظهار رسالة «لقد تم تسوية الحساب».
+    تُستدعى حصرياً من معالجات تسجيل عمليات السداد (نصاً أو زراً) بعد لحظة
+    وصول رصيد العميل إلى صفر. لا تُستدعى أبداً من أي مسار عرض (بطاقة/كشف/قائمة).
+
+    - عند تمرير `query` (مسار الزر): ترسل رسالة جديدة عبر query.message.
+    - عند تمرير `message` (مسار النص): ترسل رسالة جديدة عبره.
+    بعد تأكيد التسليم لا تُعاد الرسالة مرة أخرى لأي سبب — لا يوجد تخزين حالة
+    ولا فحص «الرصيد==0» على العرض (Query State).
+    """
+    if not _account_fully_settled(customer_id):
+        return
+    try:
+        ledger = db.get_ledger(customer_id)
+    except Exception:  # noqa: BLE001
+        ledger = []
+    if not ledger:
+        return  # لا سجل سابق — لا داعي لعرض خيار الحذف
+    target_message = (query.message if query is not None else message) or None
+    if target_message is None:
+        return
+    try:
+        await target_message.reply_text(
+            _SETTLE_MSG,
+            reply_markup=_settle_keyboard(customer_id),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("تعذّر عرض رسالة التسوية التلقائية — نكمل بلا كسر")
 
 
 async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1274,17 +1318,12 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 parse_mode=ParseMode.MARKDOWN,
             )
             # ── تسوية تلقائية: سداد لترات أوصل الحساب كله للصفر ──
-            if pending["entry_type"] == "credit" and _account_fully_settled(customer_id):
-                try:
-                    ledger = db.get_ledger(customer_id)
-                except Exception:  # noqa: BLE001
-                    ledger = []
-                if ledger:
-                    await update.effective_message.reply_text(
-                        "✅ لقد تم تسوية الحساب بشكل كامل.\n"
-                        "هل تريد حذف جميع العمليات السابقة؟",
-                        reply_markup=_settle_keyboard(customer_id),
-                    )
+            if pending["entry_type"] == "credit":
+                await _prompt_auto_settlement(
+                    context,
+                    customer_id,
+                    message=update.effective_message,
+                )
             context.user_data.pop("pending_tx", None)
             return ConversationHandler.END
 
@@ -1318,17 +1357,12 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
         # ── كشف التسوية التلقائية: أصبح الحساب كله صفراً بعد سداد ──
-        if pending["action"] == ACTION_CREDIT and _account_fully_settled(customer_id):
-            try:
-                ledger = db.get_ledger(customer_id)
-            except Exception:  # noqa: BLE001
-                ledger = []
-            if ledger:
-                await update.effective_message.reply_text(
-                    "✅ لقد تم تسوية الحساب بشكل كامل.\n"
-                    "هل تريد حذف جميع العمليات السابقة؟",
-                    reply_markup=_settle_keyboard(customer_id),
-                )
+        if pending["action"] == ACTION_CREDIT:
+            await _prompt_auto_settlement(
+                context,
+                customer_id,
+                message=update.effective_message,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تنفيذ العملية")
         await update.effective_message.reply_text(
@@ -1537,18 +1571,12 @@ async def _execute_pending_from_callback(
                 parse_mode=ParseMode.MARKDOWN,
             )
             # ── تسوية تلقائية: سداد لترات أوصل الحساب كله للصفر ──
-            if pending["entry_type"] == "credit" and _account_fully_settled(customer_id):
-                try:
-                    ledger = db.get_ledger(customer_id)
-                except Exception:  # noqa: BLE001
-                    ledger = []
-                if ledger:
-                    await _safe_reply(
-                        query.message,
-                        "✅ لقد تم تسوية الحساب بشكل كامل.\n"
-                        "هل تريد حذف جميع العمليات السابقة؟",
-                        reply_markup=_settle_keyboard(customer_id),
-                    )
+            if pending["entry_type"] == "credit":
+                await _prompt_auto_settlement(
+                    context,
+                    customer_id,
+                    query=query,
+                )
             context.user_data.pop("pending_tx", None)
             return ConversationHandler.END
 
@@ -1579,18 +1607,12 @@ async def _execute_pending_from_callback(
             parse_mode=ParseMode.MARKDOWN,
         )
         # ── كشف التسوية التلقائية: أصبح الحساب كله صفراً بعد سداد ──
-        if pending["action"] == ACTION_CREDIT and _account_fully_settled(customer_id):
-            try:
-                ledger = db.get_ledger(customer_id)
-            except Exception:  # noqa: BLE001
-                ledger = []
-            if ledger:
-                await _safe_reply(
-                    query.message,
-                    "✅ لقد تم تسوية الحساب بشكل كامل.\n"
-                    "هل تريد حذف جميع العمليات السابقة؟",
-                    reply_markup=_settle_keyboard(customer_id),
-                )
+        if pending["action"] == ACTION_CREDIT:
+            await _prompt_auto_settlement(
+                context,
+                customer_id,
+                query=query,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تنفيذ العملية عند الضغط")
         await _safe_edit(

@@ -663,3 +663,100 @@ def test_settlement_keyboard_buttons_register():
         assert any(re.match(p, data) for p in patterns), (
             f"الزر {data} لا يطابق النمط (زر ميت!)"
         )
+# ═══════════════════════════════════════════════════════════════
+# 8) رسالة التسوية — EVENT-DRIVEN فقط (لا تظهر على العرض)
+# ═══════════════════════════════════════════════════════════════
+def test_card_view_never_prompts_settlement(monkeypatch):
+    """حسابَية حرجة: عرض بطاقة عميل رصيده صفر لا يُظهر رسالة التسوية.
+
+    انحدار محتمل: لو وُضع فحص «الرصيد == 0» داخل مسار العرض (Query State)
+    لظهرت الرسالة عند كل استعلام للبطاقة حتى بلا أي سداد جديد. المطلوب:
+    الرسالة تظهر EVENT فقط بعد تسجيل سداد، لا في أي عرض عام.
+    """
+    import app.bot as botmod  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    _patch_card(monkeypatch, mazot="0.000", benzine="0.000", balance="0.00")
+    # في وضع ledger موجود لعرض كامل، لكن الرصيد صفر
+    monkeypatch.setattr(
+        sdb,
+        "get_ledger",
+        lambda cid: [
+            {"id": "t1", "amount": "100.00", "tx_type": "debit",
+             "created_at": "2026-09-01T10:00:00+00:00", "running_balance": "100.00"},
+            {"id": "t2", "amount": "100.00", "tx_type": "credit",
+             "created_at": "2026-09-02T10:00:00+00:00", "running_balance": "0.00"},
+        ],
+    )
+    upd = _Upd()
+    asyncio.run(botmod._show_balance(upd, "محمد"))
+    all_text = "\n".join(t for t, _ in upd.effective_message.sent)
+    assert "لقد تم تسوية الحساب" not in all_text, (
+        "عرض البطاقة أطلق رسالة التسوية — يجب أن تكون EVENT-Driven فقط"
+    )
+
+
+def test_settlement_prompt_only_for_credit_after_zero(monkeypatch):
+    """رسالة التسوية تُطلق فقط بعد تسجيل سداد يُصفّر الحساب.
+
+    - السداد الذي يجعل الرصيد صفراً → تُطلق مرة واحدة فوراً.
+    - السداد الذي لا يصفّر (بقي رصيد) → لا تُطلق.
+    - الدين لا يُطلق حتى لو وصل لصفر عن طريق الخطأ.
+    """
+    from app.bot import _prompt_auto_settlement  # noqa: PLC0415
+    from app.services import db as sdb  # noqa: PLC0415
+
+    # محاكاة: سداد صفّر الحساب
+    monkeypatch.setattr(sdb, "get_balance", lambda cid: Decimal("0.00"))
+    monkeypatch.setattr(
+        sdb, "get_fuel_balance",
+        lambda cid, ft=None: Decimal("0.000") if ft == "mazot" else Decimal("0.000"),
+    )
+    monkeypatch.setattr(
+        sdb, "get_ledger",
+        lambda cid: [{"id": "t1", "amount": "50.00", "tx_type": "credit",
+                      "created_at": "2026-09-02T10:00:00+00:00"}],
+    )
+
+    class _Ctx:
+        user_data = {}
+
+    msg = _Msg()
+    asyncio.run(_prompt_auto_settlement(_Ctx(), "c1", message=msg))
+    assert len(msg.sent) == 1 and "لقد تم تسوية الحساب" in msg.sent[0][0]
+
+    # سداد لم يصفّر الحساب (رصيد باقٍ) → لا تُطلق
+    monkeypatch.setattr(sdb, "get_balance", lambda cid: Decimal("500.00"))
+    msg2 = _Msg()
+    asyncio.run(_prompt_auto_settlement(_Ctx(), "c1", message=msg2))
+    assert msg2.sent == [], "رسالة التسوية لا تصح عند بقاء رصيد"
+
+    # رصيد صفر لكن بلا سجل سابق → لا تُطلق (لا داعي لعرض خيار الحذف)
+    monkeypatch.setattr(sdb, "get_balance", lambda cid: Decimal("0.00"))
+    monkeypatch.setattr(sdb, "get_ledger", lambda cid: [])
+    msg3 = _Msg()
+    asyncio.run(_prompt_auto_settlement(_Ctx(), "c1", message=msg3))
+    assert msg3.sent == [], "بلا سجل سابق لا حاجة لعرض خيار الحذف"
+
+    # مسار الزر: رصيد صفَر + سجل سابق → تُطلق مرة واحدة عبر query.message
+    monkeypatch.setattr(
+        sdb,
+        "get_ledger",
+        lambda cid: [{"id": "t1", "amount": "50.00", "tx_type": "credit",
+                      "created_at": "2026-09-02T10:00:00+00:00"}],
+    )
+
+    class _QMsg:
+        def __init__(self):
+            self.sent = []
+
+        async def reply_text(self, text, **kw):
+            self.sent.append((text, kw))
+
+    class _Q:
+        def __init__(self):
+            self.message = _QMsg()
+
+    q = _Q()
+    asyncio.run(_prompt_auto_settlement(_Ctx(), "c1", query=q))
+    assert len(q.message.sent) == 1 and "لقد تم تسوية الحساب" in q.message.sent[0][0]
