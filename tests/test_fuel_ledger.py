@@ -435,12 +435,11 @@ def test_show_balance_integrated_card_cash_and_fuel_separate(monkeypatch):
     # قسم النقد
     assert "بطاقة العميل" in text
     assert "الرصيد النقدي" in text
-    assert "15,000.00" in text
+    assert "15,000 ل.س" in text
+    assert "15,000.00" not in text  # لا فواصل عشرية لليرة السورية
     # قسم اللترات — منفصل ومُعلَّم كحساب مستقل
-    assert "رصيد اللترات" in text
-    assert "مازوت: 120 لتر" in text
+    assert "⛽ مازوت: 120 لتر" in text
     assert "بنزين: 8.5 لتر" in text
-    assert "حساب مستقل عن النقد" in text
 
 
 def test_show_balance_fuel_only_card(monkeypatch):
@@ -451,12 +450,12 @@ def test_show_balance_fuel_only_card(monkeypatch):
     upd = _Upd()
     asyncio.run(botmod._show_balance(upd, "محمد", fuel_only=True, fuel_type="mazot"))
     text = upd.effective_message.sent[0][0]
-    assert "رصيد مازوت للعميل" in text
+    assert "⛽ محطة محروقات العمر" in text
     assert "120 لتر" in text
-    # لا قيمة نقدية تسرّب إلى كشف اللترات (التذييل يذكر العبارة عمداً كتنويه)
+    # لا قيمة نقدية تسرّب إلى كشف اللترات
     assert "15,000.00" not in text
+    assert "15,000 ل.س" not in text
     assert "سداد" not in text
-    assert "مستقل تماماً عن الرصيد النقدي" in text
 
 
 def test_show_balance_fuel_only_empty(monkeypatch):
@@ -490,8 +489,9 @@ def test_show_balance_old_db_without_fuel_table_no_crash(monkeypatch):
     asyncio.run(botmod._show_balance(upd, "محمد"))
     text = upd.effective_message.sent[0][0]
     assert "الرصيد النقدي" in text
-    assert "7,000.00" in text
-    assert "⛽" not in text  # لا قسم وقود ولا انهيار
+    assert "7,000 ل.س" in text
+    assert "7,000.00" not in text  # لا فواصل عشرية لليرة السورية
+    assert "لتر" not in text  # لا قسم وقود ولا انهيار
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -547,6 +547,27 @@ class Database:
         q = urllib.parse.urlencode({"id": f"eq.{customer_id}"})
         self._req("DELETE", "customers", q)
 
+    def delete_customer_transactions(
+        self, customer_id: str, confirm: bool = False
+    ) -> int:
+        """حذف كل معاملات عميل دون المساس ببياناته أو أرصدته السابقة.
+
+        يُمسح كل سجل العمليات النقدية القديمة للعميل، ويُستخدم بعد
+        تسوية الحساب بالكامل (وصول الرصيد إلى صفر) للأرشفة النظيفة.
+        يتطلب confirm=True صريحاً كحماية.
+        """
+        if not confirm:
+            raise RuntimeError(
+                "حماية: delete_customer_transactions يتطلب confirm=True"
+            )
+        # حذف المعاملات النقدية
+        qtx = urllib.parse.urlencode({"customer_id": f"eq.{customer_id}"})
+        self._req("DELETE", "transactions", qtx)
+        # حذف حركات الوقود
+        qf = urllib.parse.urlencode({"customer_id": f"eq.{customer_id}"})
+        self._req("DELETE", "fuel_ledger", qf)
+        return 0
+
     def merge_customer(self, source_id: str, target_id: str) -> dict:
         """دمج حسابين (مصدر ← هدف) — يحوّل كل حركات المصدر للهدف ثم يحذف المصدر.
 

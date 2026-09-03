@@ -62,6 +62,15 @@ CALLBACK_ALERT_PREFIX = "alert:"
 CALLBACK_HIST_PREFIX = "hist:"
 CALLBACK_ACC_ADD_PREFIX = "accadd:"
 
+# حذف حساب نهائي — نظام تأكيد بمستويين:
+# del:<id> → اختيار الحذف → delyes:<id> → تنفيذ فوري
+CALLBACK_DELETE_PREFIX = "del:"
+CALLBACK_DELETE_YES_PREFIX = "delyes:"
+
+# تصفير السجل بعد التسوية التلقائية
+CALLBACK_SETTLE_CLEAR_PREFIX = "settleyes:"
+CALLBACK_SETTLE_KEEP = "settlekeep"
+
 # أزرار تصفير البيانات — نظام تأكيد مزدوج بمستويين:
 # 1) reset_no → إلغاء    2) resetmode:soft|full → اختيار نمط التصفير
 # 3) resetyes:soft|full → تأكيد نهائي ثم تنفيذ
@@ -94,6 +103,7 @@ _BOT_COMMANDS: list[BotCommand] = [
     BotCommand("backup", "💾 نسخ احتياطي"),
     BotCommand("restore", "📤 استعادة نسخة"),
     BotCommand("reset", "🗑️ تصفير البيانات"),
+    BotCommand("del", "🗑️ حذف حساب عميل"),
 ]
 
 
@@ -196,6 +206,155 @@ def _hi_num(text: object) -> str:
     حسب متطلب المستخدم «جميع الأرقام أجنبية فقط».
     """
     return str(text or "")
+
+
+
+# ── تنسيقات عرض موحّدة ──────────────────────────────────────────
+
+def _fmt_money_int(value) -> str:
+    """مبلغ صحيح بدون فواصل عشرية — لليرة السورية: «7,000 ل.س»."""
+    d = to_decimal(value)
+    sign = "-" if d < 0 else ""
+    whole = abs(int(d.to_integral_value(rounding="ROUND_FLOOR")))
+    formatted = f"{whole:,}"
+    return f"{sign}{_hi_num(formatted)} ل.س"
+
+
+def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) -> str:
+    """كشف حساب لترات موحّد — تنسيق سطر واحد لكل عملية بترقيم تسلسلي.
+
+    الصيغة:
+        ⛽ محطة محروقات العمر
+        كشف حساب — [اسم العميل]
+        ────────────────────
+        الرصيد الحالي: [X] لتر
+
+        📋 العمليات (N):
+        [كتلة monospace]
+        #1   سحب   [X] لتر   → [الرصيد]
+        ...
+        ────────────────────
+        ⚖️ صافي الرصيد: [X] لتر
+    """
+    sep = "────────────────────"
+    lines = [
+        "⛽ محطة محروقات العمر",
+        f"كشف حساب — {name}",
+        sep,
+        f"الرصيد الحالي: {_fmt_liters(balance)} لتر",
+        "",
+        f"📋 العمليات ({len(activity)}):",
+        "",
+    ]
+    # حساب الرصيد التراكمي محلياً من activity (مرتبة تنازلياً زمنياً)
+    # نعكسها لنحسب من الأقدم أولاً
+    running = Decimal("0.000")
+    rows = []
+    for r in reversed(activity):
+        liters = Decimal(str(r.get("liters") or 0))
+        etype = r.get("entry_type")
+        if etype == "credit" and liters > 0:
+            liters = -liters
+        elif etype == "debit" and liters < 0:
+            liters = abs(liters)
+        running += liters
+        rows.append((liters, running))
+    # نعكس العرض للأقدم أولاً
+    rows.reverse()
+    body = []
+    for idx, (liters, bal) in enumerate(rows, 1):
+        op = "سحب" if liters > 0 else "إيداع"
+        body.append(
+            f"#{_hi_num(str(idx))}   {op}   {_fmt_liters(liters)} لتر"
+            f"   → {_fmt_liters(bal)}"
+        )
+    if body:
+        lines.append("```")
+        lines.extend(body)
+        lines.append("```")
+    lines += [
+        sep,
+        f"⚖️ صافي الرصيد: {_fmt_liters(balance)} لتر",
+    ]
+    return "\n".join(lines)
+
+
+def _render_customer_card(
+    name: str,
+    balance: Decimal,
+    fuel_balances: dict[str, Decimal] | None,
+    ledger: list[dict],
+    cust_id: str,
+) -> str:
+    """بطاقة عميل موحّدة: نقدي + لترات + سجل بعمليات مرقّمة وتواريخ.
+
+    الصيغة:
+        ⛽ محطة محروقات العمر
+        بطاقة العميل — [اسم العميل]
+        ────────────────────
+        💰 الرصيد النقدي: [X,000] ل.س
+        ⛽ مازوت: [X] لتر  |  بنزين: [X] لتر
+        ────────────────────
+
+        📋 العمليات (N):
+        [كتلة monospace]
+        📅 DD/MM/YYYY
+        #1   دين/سداد   [+/-X]   →   [الرصيد]
+        ...
+        ────────────────────
+        ⚖️ الرصيد الصافي: [X,000] ل.س
+    """
+    sep = "────────────────────"
+    lines = [
+        "⛽ محطة محروقات العمر",
+        f"بطاقة العميل — {name}",
+        sep,
+        f"💰 الرصيد النقدي: {_fmt_money_int(balance)}",
+    ]
+    if fuel_balances and (fuel_balances.get("mazot", 0) != 0 or fuel_balances.get("benzine", 0) != 0):
+        lines.append(
+            f"⛽ مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
+            f"  |  بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر"
+        )
+    lines.append(sep)
+    lines.append("")
+    lines.append(f"📋 العمليات ({len(ledger)}):")
+    lines.append("")
+
+    body = []
+    running = Decimal("0.000")
+    # نحسب الرصيد التراكمي من الأقدم (ledger مرتب تصاعدياً من get_ledger)
+    balances_map: dict[str, Decimal] = {}
+    for r in ledger:
+        amt = to_decimal(r.get("amount") or 0)
+        if r.get("tx_type") == "debit":
+            running += amt
+        else:
+            running -= amt
+        balances_map[r.get("id", "")] = running
+
+    for idx, r in enumerate(ledger, 1):
+        tx_type = r.get("tx_type", "")
+        kind = "دين" if tx_type == "debit" else "سداد"
+        amt = to_decimal(r.get("amount") or 0)
+        abs_whole = abs(int(amt.to_integral_value(rounding="ROUND_FLOOR")))
+        abs_fmt = _hi_num(f"{abs_whole:,}")
+        signed = f"-{abs_fmt}" if tx_type == "debit" else f"+{abs_fmt}"
+        bal = balances_map.get(r.get("id", ""), Decimal("0.00"))
+        dt = _fmt_dt_compact(r.get("created_at"))
+        body.append(f"📅 {dt}")
+        body.append(f"#{_hi_num(str(idx))}   {kind}   {signed} ل.س   →   {_fmt_money_int(bal)}")
+
+    if body:
+        lines.append("```")
+        lines.extend(body)
+        lines.append("```")
+
+    lines += [
+        sep,
+        f"⚖️ الرصيد الصافي: {_fmt_money_int(balance)}",
+    ]
+    return "\n".join(lines)
 
 
 def _fmt_dt(iso: object, with_time: bool = True) -> str:
@@ -1107,6 +1266,31 @@ async def _execute_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"الرصيد الحالي: *{_fmt_money(balance)}*",
             parse_mode=ParseMode.MARKDOWN,
         )
+
+        # ── كشف التسوية التلقائية: إن أصبح الرصيد صفراً بعد سداد ──
+        if pending["action"] == ACTION_CREDIT and balance == 0:
+            try:
+                ledger = db.get_ledger(customer_id)
+            except Exception:  # noqa: BLE001
+                ledger = []
+            if ledger:
+                kb = [
+                    [
+                        InlineKeyboardButton(
+                            "🗑️ نعم، احذف السجل",
+                            callback_data=f"{CALLBACK_SETTLE_CLEAR_PREFIX}{customer_id}",
+                        ),
+                        InlineKeyboardButton(
+                            "📋 لا، أبقِ السجل",
+                            callback_data=CALLBACK_SETTLE_KEEP,
+                        ),
+                    ]
+                ]
+                await update.effective_message.reply_text(
+                    "✅ لقد تم تسوية الحساب بشكل كامل.\n"
+                    "هل تريد حذف جميع العمليات السابقة؟",
+                    reply_markup=InlineKeyboardMarkup(kb),
+                )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تنفيذ العملية")
         await update.effective_message.reply_text(
@@ -1161,72 +1345,56 @@ async def _show_balance(
                     parse_mode=ParseMode.MARKDOWN,
                 )
                 return
-            if fuel_type and fuel_type in fuel_balances:
-                only = fuel_balances[fuel_type]
-                f_label = "مازوت" if fuel_type == "mazot" else "بنزين"
-                meta = [
-                    f"⛽ رصيد {f_label} للعميل — {cust['name']}",
-                    f"{f_label}: {_fmt_liters(only)} لتر",
-                ]
-            else:
-                meta = [
-                    f"⛽ كشف لترات العميل — {cust['name']}",
-                    f"مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
-                    f" | بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر",
-                ]
-            meta.append(f"📅 تاريخ الجرد: {_fmt_dt(_local_now().isoformat())}")
-            meta.append("حساب اللترات مستقل تماماً عن الرصيد النقدي.")
             try:
                 activity_f = db.get_fuel_activity(
                     cust["id"], fuel_type=fuel_type, limit=10000
                 )
             except Exception:  # noqa: BLE001
                 activity_f = []
-            if activity_f:
-                meta.append(
-                    f"سجل العمليات الكامل ({len(activity_f)} عملية) — الأقدم أولاً:"
-                )
-                rows, footer = _fuel_card_rows(activity_f)
-                table = _grid(
-                    ["التاريخ", "العملية", "اللترات", "الرصيد"],
-                    rows, ["l", "l", "r", "r"],
-                )
+            if fuel_type and fuel_type in fuel_balances:
+                fuel_balance = fuel_balances[fuel_type]
             else:
-                table, footer = [], []
-                meta += ["", "— لا توجد حركات لترات مفصلة لعرضها بعد."]
-            await _reply_card(update, _split_pages(meta, table, footer))
+                fuel_balance = None
+            statement = _render_fuel_statement(
+                cust["name"],
+                activity_f,
+                fuel_balance if fuel_balance is not None else (
+                    fuel_balances["mazot"] + fuel_balances["benzine"]
+                ),
+            )
+            await update.effective_message.reply_text(statement)
             return
 
-        # ── البطاقة الموحّدة: مربع نسخ واحد (البيانات + سجل العمليات الكامل) ──
+        # ── البطاقة الموحّدة: نقدي + لترات + سجل بعمليات مرقّمة ──
         balance = db.get_balance(cust["id"])
         try:
             ledger = db.get_ledger(cust["id"])  # الكامل: الأقدم أولاً + رصيد تراكمي
         except Exception:  # noqa: BLE001
             ledger = []
 
-        meta = [
-            f"💳 بطاقة العميل — {cust['name']}",
-            f"💰 الرصيد النقدي: {_fmt_money(balance)}",
-        ]
-        if has_fuel:
-            meta += [
-                "⛽ رصيد اللترات (حساب مستقل عن النقد):",
-                f"   مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
-                f" | بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر",
+        card = _render_customer_card(
+            cust["name"],
+            balance,
+            fuel_balances if has_fuel else None,
+            ledger,
+            cust["id"],
+        )
+        await update.effective_message.reply_text(card)
+
+        # ── زر حذف الحساب (إن وجدت معاملات) ──
+        if ledger or has_fuel:
+            kb = [
+                [
+                    InlineKeyboardButton(
+                        "🗑️ حذف الحساب بالكامل",
+                        callback_data=f"{CALLBACK_DELETE_PREFIX}{cust['id']}",
+                    ),
+                ]
             ]
-        meta.append(f"📅 تاريخ الجرد: {_fmt_dt(_local_now().isoformat())}")
-        if ledger:
-            meta.append(f"سجل العمليات الكامل ({len(ledger)} عملية) — الأقدم أولاً:")
-            rows, footer = _cash_card_rows(ledger)
-            footer.append(f"⚖️ الرصيد الصافي: {_fmt_money(balance)}")
-            table = _grid(
-                ["التاريخ", "النوع", "المبلغ", "الرصيد"],
-                rows, ["l", "l", "r", "r"],
+            await update.effective_message.reply_text(
+                "⚠️ خطر: حذف الحساب يُمسح كل البيانات نهائياً.",
+                reply_markup=InlineKeyboardMarkup(kb),
             )
-        else:
-            table, footer = [], []
-            meta += ["", "— لا توجد حركات نقدية مسجلة لهذا العميل بعد."]
-        await _reply_card(update, _split_pages(meta, table, footer))
     except Exception:  # noqa: BLE001
         logger.exception("فشل عرض الرصيد")
         await update.effective_message.reply_text("خطأ في جلب الرصيد. حاول مجدداً.")
@@ -1574,6 +1742,78 @@ async def on_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         return
 
+    # ── حذف حساب نهائي — تأكيد ثم تنفيذ فوري ──
+    if data.startswith(CALLBACK_DELETE_PREFIX):
+        if not is_owner(update):
+            await _safe_answer(query, "غير مصرح به")
+            return
+        cid = data.split(":", 1)[1]
+        cust = db.get_customer_by_id(cid)
+        if not cust:
+            await _safe_edit(query, "لم أجد العميل — ربما حُذف مسبقاً.")
+            return
+        kb = [
+            [
+                InlineKeyboardButton(
+                    "⚠️ نعم، احذف نهائياً",
+                    callback_data=f"{CALLBACK_DELETE_YES_PREFIX}{cid}",
+                ),
+                InlineKeyboardButton("❌ إلغاء", callback_data="undo_cancel"),
+            ]
+        ]
+        await _safe_edit(
+            query,
+            f"🗑️ *تأكيد حذف الحساب*\n\n"
+            f"العميل: *{cust['name']}*\n\n"
+            f"⚠️ سيتم مسح كل شيء نهائياً:\n"
+            f"• كل المعاملات النقدية\n"
+            f"• كل حركات الوقود (مازوت/بنزين)\n"
+            f"• بيانات العميل نفسه\n\n"
+            f"هل أنت متأكد تماماً؟",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    if data.startswith(CALLBACK_DELETE_YES_PREFIX):
+        if not is_owner(update):
+            await _safe_answer(query, "غير مصرح به")
+            return
+        cid = data.split(":", 1)[1]
+        cust = db.get_customer_by_id(cid)
+        cname = cust["name"] if cust else "العميل"
+        try:
+            db.delete_customer(cid, confirm=True)
+            await _safe_edit(
+                query,
+                f"🗑️ تم حذف حساب *{cname}* بالكامل.\n\n"
+                f"كل البيانات مُحيت نهائياً دون نسخ احتياطية.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("فشل حذف العميل")
+            await _safe_edit(query, f"خطأ في الحذف: {str(exc)}")
+        return
+
+    # ── تصفير السجل بعد التسوية التلقائية ──
+    if data.startswith(CALLBACK_SETTLE_CLEAR_PREFIX):
+        cid = data.split(":", 1)[1]
+        try:
+            db.delete_customer_transactions(cid, confirm=True)
+            await _safe_edit(
+                query,
+                "🗑️ تم حذف جميع العمليات السابقة.\n"
+                "السجل الآن نظيف والجاهز لبدء جديد.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("فشل حذف سجل العميل")
+            await _safe_edit(query, f"خطأ في حذف السجل: {str(exc)}")
+        return
+
+    if data == CALLBACK_SETTLE_KEEP:
+        await _safe_edit(query, "📋 تم الإبقاء على السجل كما هو.")
+        return
+
     # توجيه نحو إدخال قيد محاسبي
     if data.startswith(CALLBACK_ACC_ADD_PREFIX):
         entry_type = data.split(":", 1)[1]
@@ -1865,8 +2105,57 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await _reply_card(update, _split_pages(meta, table, footer))
     except ValueError:
         await update.effective_message.reply_text(f"لا يوجد عميل باسم «{name}».")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("فشل عرض بطاقة العميل")
+        await update.effective_message.reply_text(f"خطأ: {str(exc)}")
+    return ConversationHandler.END
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """حذف حساب عميل بالكامل — أمر إداري يتطلب تأكيد مزدوج.
+
+    الاستخدام: /del <اسم العميل>
+    يُعرض زر تأكيد قبل التنفيذ — وعند التأكيد يُمسح العميل وكل
+    معاملاته وحركات الوقود فوراً ونهائياً دون أي نسخ احتياطية.
+    """
+    if not is_owner(update):
+        await _guard(update)
+        return ConversationHandler.END
+    args = (context.args or [])
+    if not args:
+        await update.effective_message.reply_text(
+            "استخدام:  /del <اسم العميل>\nمثال:  /del محمد"
+        )
+        return ConversationHandler.END
+    name = " ".join(args).strip()
+    try:
+        found = db.find_customer(name)
+        if not found:
+            await update.effective_message.reply_text(
+                f"لم أجد عميلاً باسم «{name}» في السجلات."
+            )
+            return ConversationHandler.END
+        bal = db.get_balance(found["id"])
+        kb = [
+            [
+                InlineKeyboardButton(
+                    "⚠️ نعم، احذف نهائياً",
+                    callback_data=f"{CALLBACK_DELETE_PREFIX}{found['id']}",
+                ),
+                InlineKeyboardButton("❌ إلغاء", callback_data="undo_cancel"),
+            ]
+        ]
+        await update.effective_message.reply_text(
+            f"🗑️ *حذف حساب العميل {found['name']}*\n\n"
+            f"الرصيد الحالي: *{_fmt_money(bal)}*\n\n"
+            f"⚠️ هذا الإجراء *نهائي ولا رجعة فيه*.\n"
+            f"سيتم مسح كل المعاملات وحركات الوقود.\n"
+            f"هل أنت متأكد؟",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("فشل عرض تأكيد الحذف")
         await update.effective_message.reply_text(f"خطأ: {str(exc)}")
     return ConversationHandler.END
 
@@ -2750,6 +3039,7 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("card", cmd_card))
+    app.add_handler(CommandHandler("del", cmd_delete))
     # التصفير (للمالك فقط — تأكيد مزدوج بمستويين عبر الأزرار)
     app.add_handler(CommandHandler("reset", cmd_reset))
     # الميزات التحليلية
@@ -2771,7 +3061,9 @@ def build_application(settings: Settings) -> Application:
                 r"^(page:\d+|quick|bal:[0-9a-fA-F-]+|undo:[0-9a-fA-F-]+|"
                 r"undofuel:[0-9a-fA-F-]+|undo_cancel|menu:\w+|alert:(on|off|days:\d+)|"
                 r"hist:[0-9a-fA-F-]+:\d+|accadd:(income|expense)|"
-                r"resetmode:(soft|full)|resetyes:(soft|full)|reset_no)$"
+                r"resetmode:(soft|full)|resetyes:(soft|full)|reset_no|"
+                r"del:[0-9a-fA-F-]+|delyes:[0-9a-fA-F-]+|"
+                r"settleyes:[0-9a-fA-F-]+|settlekeep)$"
             ),
         )
     )

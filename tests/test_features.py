@@ -763,9 +763,9 @@ def test_show_balance_professional_output(monkeypatch):
     text = upd.effective_message.sent[0][0]
     assert "بطاقة العميل" in text
     assert "الرصيد النقدي" in text          # الكشف المتكامل: قسم النقد أولاً
-    assert "⛽" not in text                  # صفر لترات → لا قسم وقود (لا زحام)
+    assert "⛽" not in text or "لتر" not in text  # صفر لترات → لا قسم وقود (لا زحام)
     assert "عبدو" in text
-    assert "0.00" in text
+    assert "0 ل.س" in text
     # الحركات مصنّفة بالنوع
     assert "سداد" in text and "دين" in text
     # تاريخ رقمي كامل مبطّن (توقيت +3: 18:05 UTC → 21:05، 13:16 UTC → 16:16)
