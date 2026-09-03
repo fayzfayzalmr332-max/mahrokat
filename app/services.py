@@ -1289,24 +1289,25 @@ class Database:
             "top_categories": top_expense,
         }
 
+    def _count_rows(self, path: str) -> int:
+        """عدّ صفوف جدول بأمان — helper مشترك لدوال التصفير (كان مكرراً محلياً مرتين)."""
+        try:
+            _, rows = self._req("GET", path, "select=id&limit=10000")
+            return len(rows) if isinstance(rows, list) else 0
+        except RuntimeError as exc:  # noqa: BLE001
+            logger.warning("تعذّر عدّ %s: %s", path, exc)
+            return 0
+
     def reset_all_data(self) -> dict:
         """تصفير كل بيانات المحطة نهائياً (عملاء + معاملات + محاسبي).
 
         مسؤولة وخطيرة — لا تُستدعى إلا بعد تأكيد مزدوج صريح من المالك/المحاسب.
         ترتيب الحذف يحترم القيود المرجعية: القيود المحاسبية ← المعاملات ← العملاء.
         """
-        def _count(path: str) -> int:
-            try:
-                _, rows = self._req("GET", path, "select=id&limit=10000")
-                return len(rows) if isinstance(rows, list) else 0
-            except RuntimeError as exc:  # noqa: BLE001
-                logger.warning("تعذّر عدّ %s: %s", path, exc)
-                return 0
-
         counts = {
-            "transactions": _count("transactions"),
-            "customers": _count("customers"),
-            "account_entries": _count("account_entries"),
+            "transactions": self._count_rows("transactions"),
+            "customers": self._count_rows("customers"),
+            "account_entries": self._count_rows("account_entries"),
         }
 
         # PostgREST يرفض DELETE بلا فلتر؛ id=neq.zero يطابق كل الصفوف الفعلية
@@ -1330,18 +1331,10 @@ class Database:
         الأرصدة مشتقة من المعاملات (RPC/Views) لذا تصفّر تلقائياً بحذفها —
         مناسب لبداية دورة محاسبية جديدة دون فقدان دفتر العملاء.
         """
-        def _count(path: str) -> int:
-            try:
-                _, rows = self._req("GET", path, "select=id&limit=10000")
-                return len(rows) if isinstance(rows, list) else 0
-            except RuntimeError as exc:  # noqa: BLE001
-                logger.warning("تعذّر عدّ %s: %s", path, exc)
-                return 0
-
         counts = {
-            "transactions": _count("transactions"),
+            "transactions": self._count_rows("transactions"),
             "customers": 0,  # العملاء يبقون في هذا الوضع
-            "account_entries": _count("account_entries"),
+            "account_entries": self._count_rows("account_entries"),
         }
         q = urllib.parse.urlencode({"id": f"neq.{_NULL_UUID}"})
         for path in ("account_entries", "transactions"):
