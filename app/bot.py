@@ -295,11 +295,14 @@ def _render_customer_card(
     cust_id: str,
     now: datetime | None = None,
 ) -> str:
-    """بطاقة العميل بالصيغة المعتمدة النهائية (الصيغة الحرفية من المالك).
+    """بطاقة العميل بالصيغة المعتمدة — مستقرة على تليجرام الموبايل العربي.
 
     المعادلة المحاسبية الصارمة: الرصيد التراكمي = السابق + الدين - السداد.
     المبالغ مخزَّنة موقَّعة (دين +/سداد −) فالتجميع: running += amt دائماً،
     والعرض: دين «+» وسداد «−» بأرقام صحيحة بلا كسور (.00 محذوف نهائياً).
+
+    الصيغة مُحسّنة للموبايل العربي: التسميات بعد الأرقام (تتدفق طبيعياً
+    مع اتجاه RTL)، فواصل مسافات بسيطة بلا أقواس زخرفية تظهر مشوّهة.
     """
     sep = "══════════════════════════════"
     if now is None:
@@ -346,7 +349,7 @@ def _render_customer_card(
     rows_data = []
     for r in ledger:
         tx_type = r.get("tx_type", "")
-        kind = "ديــن" if tx_type == "debit" else "سداد"
+        kind = "دين" if tx_type == "debit" else "سداد"
         amt = to_decimal(r.get("amount") or 0)
         abs_whole = abs(int(amt.to_integral_value(rounding="ROUND_FLOOR")))
         abs_fmt = _hi_num(f"{abs_whole:,}")
@@ -354,24 +357,24 @@ def _render_customer_card(
         bal = balances_map.get(r.get("id", ""), Decimal("0.000"))
         rows_data.append(
             (
+                _fmt_dt_compact(r.get("created_at")),
                 kind,
                 signed,
                 _fmt_int_plain(bal),
-                _fmt_dt_compact(r.get("created_at")),
             )
         )
     net_plain = _fmt_int_plain(balance)
 
-    # استقامة صارمة داخل كتلة monospace: عرض عمودي المبلغ والرصيد يُحسب
-    # ديناميكياً من أطول قيمة فعلية ومحاذاة يمين — ⟪ ⟫ مستقيمة كالمسطرة
-    # مهما تفاوتت الخانات (8 مقابل 18,000) ولا سطر ينكسر.
+    # استقامة صارمة داخل كتلة monospace: التسميات بعد الأرقام (مثالية لـ RTL
+    # العربي على الموبايل)، والأعمدة الرقمية محاذاة يمين بعرض ديناميكي —
+    # فلا تعرّج مهما تفاوتت الخانات (0 مقابل 18,000).
     if rows_data:
-        w_amt = max(len(x[1]) for x in rows_data)
-        w_bal = max(len(x[2]) for x in rows_data)
+        w_amt = max(len(x[2]) for x in rows_data)
+        w_bal = max(len(x[3]) for x in rows_data)
         body = [
-            f"• {dt}  [ {kind} ]  {signed.rjust(w_amt)}"
-            f"  ⟪ الرصيد: {bal_s.rjust(w_bal)} · الصافي: {net_plain} ⟫"
-            for kind, signed, bal_s, dt in rows_data
+            f"{dt}  {kind.ljust(4)}  {signed.rjust(w_amt)}  "
+            f"الرصيد: {bal_s.rjust(w_bal)}  الصافي: {net_plain}"
+            for dt, kind, signed, bal_s in rows_data
         ]
         lines.append("```")
         lines.extend(body)

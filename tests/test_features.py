@@ -533,9 +533,9 @@ def test_card_running_balance_sign_inversion_regression():
     # التسلسل الصحيح: 7,000 → 9,000 → 7,200 → 0 → 100 → 8,000
     for expected in ("7,000", "9,000", "7,200", "100", "8,000"):
         assert expected in out
-    # ستة أسطر عمليات، وصف التصفير حاضر (الرصيد 0 محاذى يميناً داخل ⟪ ⟫)
-    assert out.count("⟪ الرصيد:") == 6
-    assert "0 ⟫" in out
+    # ستة أسطر عمليات، وصف التصفير حاضر (الرصيد 0 محاذى يميناً)
+    assert out.count("الرصيد:") == 6
+    assert "الصافي: 8,000" in out
     # القفزة الكارثية ممنوعة نهائياً
     assert "26,000" not in out
     assert "10,800" not in out and "18,000" not in out and "18,100" not in out
@@ -569,10 +569,10 @@ def test_card_no_decimal_zeros_and_db_balance_priority():
 
 
 def test_card_columns_strictly_aligned_dynamic_padding():
-    """التحقق الصارم من بيئة العرض (Telegram Render Check): ⟪ ⟫ مستقيمة.
+    """التحقق الصارم من بيئة العرض: أعمدة المبلغ والرصيد مستقيمة.
 
-    تفاوت الخانات (100 مقابل 18,000) يجب ألا يعرّج السطور: موضع ⟪
-    ونهاية عمود الرصيد موحّدان في كل صفوف كتلة monospace.
+    تفاوت الخانات (100 مقابل 18,000) يجب ألا يعرّج السطور: موضع
+    بداية ونهاية عمود الرصيد موحّدان في كل صفوف كتلة monospace.
     """
     ledger = [
         {"id": "t1", "amount": "100", "tx_type": "debit",
@@ -581,12 +581,10 @@ def test_card_columns_strictly_aligned_dynamic_padding():
          "created_at": "2026-09-01T09:00:00+00:00"},
     ]
     out = _card(ledger, "18100")
-    body = [l for l in out.splitlines() if "⟪" in l]
+    body = [l for l in out.splitlines() if "الرصيد:" in l]
     assert len(body) == 2
-    # موضع ⟪ موحّد في كل السطور (عمود المبلغ مستقيم)
-    assert {l.index("⟪") for l in body} == {body[0].index("⟪")}
-    # نهاية عمود الرصيد موحّدة: ⟫ الختامي بنفس العمود
-    assert {l.index("⟫") for l in body} == {body[0].index("⟫")}
+    # موضع بداية عمود الرصيد موحّد في كل السطور (استقامة المبلغ)
+    assert {l.index("الرصيد:") for l in body} == {body[0].index("الرصيد:")}
     # فواصل ═ متناسقة العرض في كل مواضعها
     seps = {l for l in out.splitlines() if set(l) == {"═"}}
     assert len(seps) == 1  # طول واحد فقط لكل الفواصل
@@ -859,8 +857,8 @@ def test_show_balance_professional_output(monkeypatch):
     assert "⛽" not in text or "لتر" not in text  # صفر لترات → لا قسم وقود (لا زحام)
     assert "عبدو" in text
     assert "0 ل.س" in text
-    # الحركات مصنّفة بالنوع (الصيغة المعتمدة: ديــن بالتطويل)
-    assert "سداد" in text and "ديــن" in text
+    # الحركات مصنّفة بالنوع (الصيغة المعتمدة: دين / سداد)
+    assert "سداد" in text and "دين" in text
     # تاريخ رقمي كامل مبطّن (توقيت +3: 18:05 UTC → 21:05، 13:16 UTC → 16:16)
     assert "31/08/2026" in text
     assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
@@ -991,7 +989,7 @@ def test_backup_cron_schedule_midnight_station_time():
 
 
 def test_card_shows_net_beside_running_balance():
-    """كل سطر يعرض الرصيد والصافي جنباً إلى جنب داخل ⟪ ⟫ كما طلب المالك."""
+    """كل سطر يعرض الرصيد والصافي جنباً إلى جنب — تسميات بعد الأرقام (RTL)."""
     ledger = [
         {"id": "t1", "amount": "7000", "tx_type": "debit",
          "created_at": "2026-08-31T13:16:00+00:00"},
@@ -999,8 +997,10 @@ def test_card_shows_net_beside_running_balance():
          "created_at": "2026-08-31T13:47:00+00:00"},
     ]
     out = _card(ledger, "5200")
-    assert out.count("⟪ الرصيد:") == 2
-    assert out.count("· الصافي: 5,200 ⟫") == 2
+    # الصيغة الجديدة: التاريخ + النوع + المبلغ + الرصيد + الصافي
+    assert "31/08/2026" in out
+    assert "دين" in out and "سداد" in out
+    assert "الرصيد:" in out and "الصافي: 5,200" in out
     assert "⚖️ صافي المطالبة النقدية: 5,200 ل.س" in out
 
 
