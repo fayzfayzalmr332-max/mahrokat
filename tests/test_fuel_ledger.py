@@ -458,6 +458,35 @@ def test_show_balance_fuel_only_card(monkeypatch):
     assert "سداد" not in text
 
 
+def test_fuel_statement_oldest_first_and_positive_deposit():
+    """كشف اللترات: #1 = الأقدم دائماً + الإيداع موجب + الرصيد يتصاعد.
+
+    انحدار لخلل مزدوج: كان عرض الأحدث أولاً (الرصيد يهبط من الصافي إلى
+    73) وكان الإيداع يظهر سالباً (-327) لأنه مخزَّن سالباً في القاعدة.
+    """
+    import app.bot as botmod  # noqa: PLC0415
+
+    # activity كما تعيد get_fuel_activity: الأحدث أولاً (created_at.desc)
+    # المجموع: 150 - 50 + 30 = 130 (الرصيد الصافي)
+    activity = [
+        {"id": "n", "liters": "30", "entry_type": "debit"},      # الأحدث
+        {"id": "l", "liters": "-50", "entry_type": "credit"},    # إيداع 50
+        {"id": "a", "liters": "150", "entry_type": "debit"},     # الأقدم
+    ]
+    out = botmod._render_fuel_statement("زاهر", activity, botmod.Decimal("130"))
+    lines = [l for l in out.splitlines() if l.startswith("#")]
+    # #1 = الأقدم = سحب 150
+    assert "#1" in lines[0] and "150 لتر" in lines[0]
+    assert "→ الرصيد:" in lines[0]
+    assert "150" in lines[0]  # الرصيد بعد العملية الأولى = 150
+    # الرصيد يتصاعد/ينضبط: آخر سطر = الصافي النهائي (130)
+    assert "130" in lines[-1]
+    # الإيداع يظهر موجباً بلا إشارة سالبة
+    deposit = [l for l in lines if "إيداع" in l][0]
+    assert "-50" not in deposit
+    assert "50 لتر" in deposit
+
+
 def test_show_balance_fuel_only_empty(monkeypatch):
     """لا حركات وقود إطلاقاً → رسالة توجيه بدل قسم فارغ."""
     import app.bot as botmod  # noqa: PLC0415

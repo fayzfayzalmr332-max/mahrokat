@@ -254,8 +254,9 @@ def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) ->
         f"📋 العمليات ({len(activity)}):",
         "",
     ]
-    # حساب الرصيد التراكمي محلياً من activity (مرتبة تنازلياً زمنياً)
-    # نعكسها لنحسب من الأقدم أولاً
+    # الرصيد التراكمي يُحسب من الأقدم زمنياً (activity الأحدث أولاً فنعكسها)،
+    # ثم نعرض بنفس الترتيب التصاعدي — #1 = الأقدم دائماً (إصلاح عكس مزدوج
+    # كان يعرض الأحدث أولاً فيظهر الرصيد تنازلياً  يهبط من صافي اليوم إلى الصفر).
     running = Decimal("0.000")
     rows = []
     for r in reversed(activity):
@@ -267,16 +268,21 @@ def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) ->
             liters = abs(liters)
         running += liters
         rows.append((liters, running))
-    # نعكس العرض للأقدم أولاً
-    rows.reverse()
-    body = []
-    for idx, (liters, bal) in enumerate(rows, 1):
-        op = "سحب" if liters > 0 else "إيداع"
-        body.append(
-            f"#{_hi_num(str(idx))}   {op}   {_fmt_liters(liters)} لتر"
-            f"   → {_fmt_liters(bal)}"
-        )
-    if body:
+
+    # عرض #1 = الأقدم (بدون reverse — order التصاعدي محفوظ)
+    if rows:
+        w_idx = max(len(_hi_num(str(i))) for i in range(1, len(rows) + 1))
+        w_op = max(len("سحب" if l > 0 else "إيداع") for l, _ in rows)
+        w_amt = max(len(_fmt_liters(abs(l))) for l, _ in rows)
+        w_bal = max(len(_fmt_liters(b)) for _, b in rows)
+        body = []
+        for idx, (liters, bal) in enumerate(rows, 1):
+            op = "سحب" if liters > 0 else "إيداع"
+            body.append(
+                f"#{_hi_num(str(idx)).ljust(w_idx)}   {op.ljust(w_op)}   "
+                f"{_fmt_liters(abs(liters)).rjust(w_amt)} لتر"
+                f"   → {('الرصيد: ' + _fmt_liters(bal).rjust(w_bal))}"
+            )
         lines.append("```")
         lines.extend(body)
         lines.append("```")
