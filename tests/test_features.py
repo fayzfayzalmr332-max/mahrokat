@@ -535,7 +535,7 @@ def test_card_running_balance_sign_inversion_regression():
         assert expected in out
     # ستة أسطر عمليات، وصف التصفير حاضر (الرصيد 0 محاذى يميناً)
     assert out.count("الرصيد:") == 6
-    assert "الصافي: 8,000" in out
+    assert "⚖️ صافي المطالبة النقدية: 8,000 ل.س" in out
     # القفزة الكارثية ممنوعة نهائياً
     assert "26,000" not in out
     assert "10,800" not in out and "18,000" not in out and "18,100" not in out
@@ -544,7 +544,7 @@ def test_card_running_balance_sign_inversion_regression():
     assert "💳 بطاقة العميل: عبدو الجداح" in out
     assert "📅 تاريخ الجرد: " in out
     assert "💰 الرصيد النقدي الحالي: 8,000 ل.س" in out
-    assert "📊 سجل العمليات المالي المصحح" in out
+    assert "📊 سجل العمليات المالي للعميل" in out
     assert "⚖️ صافي المطالبة النقدية: 8,000 ل.س" in out
     assert "✨ شكراً لثقتكم وموقعكم في محطة العمر" in out
     # إشارات العرض: دين + وسداد − (المعادلة: سابق + دين - سداد)
@@ -989,7 +989,7 @@ def test_backup_cron_schedule_midnight_station_time():
 
 
 def test_card_shows_net_beside_running_balance():
-    """كل سطر يعرض الرصيد والصافي جنباً إلى جنب — والصافي تراكمي كالرصيد."""
+    """كل سطر يعرض رصيداً تراكمياً واحداً واضحاً (لا تكرار يشتّت العميل)."""
     ledger = [
         {"id": "t1", "amount": "7000", "tx_type": "debit",
          "created_at": "2026-08-31T13:16:00+00:00"},
@@ -997,13 +997,13 @@ def test_card_shows_net_beside_running_balance():
          "created_at": "2026-08-31T13:47:00+00:00"},
     ]
     out = _card(ledger, "5200")
-    # الصيغة الأصلية: التاريخ + النوع (ديــن بالتطويل) + المبلغ + الرصيد + الصافي
+    # التاريخ + النوع (ديــن بالتطويل) + المبلغ + رصيد تراكمي واحد
     assert "31/08/2026" in out
     assert "ديــن" in out and "سداد" in out
-    assert "الرصيد:" in out and "الصافي:" in out
-    # الصافي تراكمي: بعد الدين = 7,000 ثم بعد السداد = 5,200 — لا ثابت على طول الطريق
-    assert "الصافي: 7,000" in out
-    assert "الصافي: 5,200" in out
+    assert out.count("⟪ الرصيد:") == 2
+    assert "⟪ الرصيد: 7,000 ⟫" in out
+    assert "⟪ الرصيد: 5,200 ⟫" in out
+    # الخلاصة النهائية فقط تحمل الصافي
     assert "⚖️ صافي المطالبة النقدية: 5,200 ل.س" in out
 
 
