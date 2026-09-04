@@ -459,10 +459,11 @@ def test_show_balance_fuel_only_card(monkeypatch):
 
 
 def test_fuel_statement_oldest_first_and_positive_deposit():
-    """كشف اللترات: #1 = الأقدم دائماً + الإيداع موجب + الرصيد يتصاعد.
+    """كشف اللترات: #1 = الأقدم + السهم ← نحو الرصيد + إشارات (+/-).
 
-    انحدار لخلل مزدوج: كان عرض الأحدث أولاً (الرصيد يهبط من الصافي إلى
-    73) وكان الإيداع يظهر سالباً (-327) لأنه مخزَّن سالباً في القاعدة.
+    انحدار لخلل مزدوج سابق (عرض الأحدث أولاً + الإيداع يظهر سالباً)
+    والتحقق من مواصفات المالك: السهم معكوس باتجاه الرصيد، السحب «+»
+    (يرفع الرصيد) والإيداع «−» (يخفضه).
     """
     import app.bot as botmod  # noqa: PLC0415
 
@@ -475,16 +476,15 @@ def test_fuel_statement_oldest_first_and_positive_deposit():
     ]
     out = botmod._render_fuel_statement("زاهر", activity, botmod.Decimal("130"))
     lines = [l for l in out.splitlines() if l.startswith("#")]
-    # #1 = الأقدم = سحب 150
-    assert "#1" in lines[0] and "150 لتر" in lines[0]
-    assert "→ الرصيد:" in lines[0]
-    assert "150" in lines[0]  # الرصيد بعد العملية الأولى = 150
+    # #1 = الأقدم = سحب 150 — والرصيد بعدها 150
+    assert "#1" in lines[0] and "سحب" in lines[0] and "+150 لتر" in lines[0]
+    assert "← الرصيد:" in lines[0] and "150" in lines[0]
     # الرصيد يتصاعد/ينضبط: آخر سطر = الصافي النهائي (130)
     assert "130" in lines[-1]
-    # الإيداع يظهر موجباً بلا إشارة سالبة
+    # الإيداع بإشارة سالبة (يخفض الرصيد) — لا موجب ولا بلا إشارة
     deposit = [l for l in lines if "إيداع" in l][0]
-    assert "-50" not in deposit
-    assert "50 لتر" in deposit
+    assert "-50 لتر" in deposit
+    assert "← الرصيد:" in deposit
 
 
 def test_show_balance_fuel_only_empty(monkeypatch):

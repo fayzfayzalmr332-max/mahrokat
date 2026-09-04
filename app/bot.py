@@ -239,10 +239,13 @@ def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) ->
 
         📋 العمليات (N):
         [كتلة monospace]
-        #1   سحب   [X] لتر   → [الرصيد]
+        #1   سحب   +[X] لتر   ← الرصيد: [التراكمي]
         ...
         ────────────────────
         ⚖️ صافي الرصيد: [X] لتر
+
+    الإشارات: السحب «+» (يرفع الرصيد) والإيداع «−» (يخفضه) — والسهم
+    ← معكوس باتجاه «الرصيد:» ليتوافق مع عرض العبارة العربية RTL.
     """
     sep = "────────────────────"
     lines = [
@@ -273,15 +276,20 @@ def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) ->
     if rows:
         w_idx = max(len(_hi_num(str(i))) for i in range(1, len(rows) + 1))
         w_op = max(len("سحب" if l > 0 else "إيداع") for l, _ in rows)
-        w_amt = max(len(_fmt_liters(abs(l))) for l, _ in rows)
+        # المبلغ مُسبَق بإشارته دائماً: + للسحب (يرفع الرصيد) و- للإيداع (يخفضه)
+        w_amt = max(
+            len(("+" if l > 0 else "-") + _fmt_liters(abs(l))) for l, _ in rows
+        )
         w_bal = max(len(_fmt_liters(b)) for _, b in rows)
         body = []
         for idx, (liters, bal) in enumerate(rows, 1):
             op = "سحب" if liters > 0 else "إيداع"
+            sign = "+" if liters > 0 else "-"
+            amount = f"{sign}{_fmt_liters(abs(liters))}"
             body.append(
                 f"#{_hi_num(str(idx)).ljust(w_idx)}   {op.ljust(w_op)}   "
-                f"{_fmt_liters(abs(liters)).rjust(w_amt)} لتر"
-                f"   → {('الرصيد: ' + _fmt_liters(bal).rjust(w_bal))}"
+                f"{amount.rjust(w_amt)} لتر"
+                f"   ← الرصيد: {_fmt_liters(bal).rjust(w_bal)}"
             )
         lines.append("```")
         lines.extend(body)
