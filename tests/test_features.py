@@ -857,8 +857,8 @@ def test_show_balance_professional_output(monkeypatch):
     assert "⛽" not in text or "لتر" not in text  # صفر لترات → لا قسم وقود (لا زحام)
     assert "عبدو" in text
     assert "0 ل.س" in text
-    # الحركات مصنّفة بالنوع (الصيغة المعتمدة: دين / سداد)
-    assert "سداد" in text and "دين" in text
+    # الحركات مصنّفة بالنوع (الصيغة الأصلية: ديــن بالتطويل كما اعتمدها المالك)
+    assert "سداد" in text and "ديــن" in text
     # تاريخ رقمي كامل مبطّن (توقيت +3: 18:05 UTC → 21:05، 13:16 UTC → 16:16)
     assert "31/08/2026" in text
     assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
@@ -989,7 +989,7 @@ def test_backup_cron_schedule_midnight_station_time():
 
 
 def test_card_shows_net_beside_running_balance():
-    """كل سطر يعرض الرصيد والصافي جنباً إلى جنب — تسميات بعد الأرقام (RTL)."""
+    """كل سطر يعرض الرصيد والصافي جنباً إلى جنب — والصافي تراكمي كالرصيد."""
     ledger = [
         {"id": "t1", "amount": "7000", "tx_type": "debit",
          "created_at": "2026-08-31T13:16:00+00:00"},
@@ -997,10 +997,13 @@ def test_card_shows_net_beside_running_balance():
          "created_at": "2026-08-31T13:47:00+00:00"},
     ]
     out = _card(ledger, "5200")
-    # الصيغة الجديدة: التاريخ + النوع + المبلغ + الرصيد + الصافي
+    # الصيغة الأصلية: التاريخ + النوع (ديــن بالتطويل) + المبلغ + الرصيد + الصافي
     assert "31/08/2026" in out
-    assert "دين" in out and "سداد" in out
-    assert "الرصيد:" in out and "الصافي: 5,200" in out
+    assert "ديــن" in out and "سداد" in out
+    assert "الرصيد:" in out and "الصافي:" in out
+    # الصافي تراكمي: بعد الدين = 7,000 ثم بعد السداد = 5,200 — لا ثابت على طول الطريق
+    assert "الصافي: 7,000" in out
+    assert "الصافي: 5,200" in out
     assert "⚖️ صافي المطالبة النقدية: 5,200 ل.س" in out
 
 

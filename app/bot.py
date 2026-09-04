@@ -349,7 +349,7 @@ def _render_customer_card(
     rows_data = []
     for r in ledger:
         tx_type = r.get("tx_type", "")
-        kind = "دين" if tx_type == "debit" else "سداد"
+        kind = "ديــن" if tx_type == "debit" else "سداد"
         amt = to_decimal(r.get("amount") or 0)
         abs_whole = abs(int(amt.to_integral_value(rounding="ROUND_FLOOR")))
         abs_fmt = _hi_num(f"{abs_whole:,}")
@@ -363,17 +363,18 @@ def _render_customer_card(
                 _fmt_int_plain(bal),
             )
         )
-    net_plain = _fmt_int_plain(balance)
 
-    # استقامة صارمة داخل كتلة monospace: التسميات بعد الأرقام (مثالية لـ RTL
-    # العربي على الموبايل)، والأعمدة الرقمية محاذاة يمين بعرض ديناميكي —
-    # فلا تعرّج مهما تفاوتت الخانات (0 مقابل 18,000).
+    # الصيغة الأصلية المعتمدة من المالك حرفياً — مع صافي تراكمي بجانب الرصيد:
+    #   • DD/MM/YYYY  [ ديــن ]  +7,000  ⟪ الرصيد: 7,000 · الصافي: 7,000 ⟫
+    # الاستقامة صارمة داخل كتلة monospace: عمودا المبلغ والرصيد يُحسبان
+    # ديناميكياً (rjust) فيستقيمان كالمسطرة مهما تفاوتت الخانات (0 مقابل 18,000).
+    # الصافي = الرصيد التراكمي بعد كل عملية — لا ثابتاً بالمجموع النهائي.
     if rows_data:
         w_amt = max(len(x[2]) for x in rows_data)
         w_bal = max(len(x[3]) for x in rows_data)
         body = [
-            f"{dt}  {kind.ljust(4)}  {signed.rjust(w_amt)}  "
-            f"الرصيد: {bal_s.rjust(w_bal)}  الصافي: {net_plain}"
+            f"• {dt}  [ {kind} ]  {signed.rjust(w_amt)}  "
+            f"⟪ الرصيد: {bal_s.rjust(w_bal)} · الصافي: {bal_s.rjust(w_bal)} ⟫"
             for dt, kind, signed, bal_s in rows_data
         ]
         lines.append("```")
