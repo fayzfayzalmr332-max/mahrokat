@@ -229,7 +229,7 @@ def _fmt_int_plain(value) -> str:
 
 
 def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) -> str:
-    """كشف حساب لترات موحّد — تنسيق سطر واحد لكل عملية بترقيم تسلسلي.
+    """كشف حساب لترات موحّد — سطر مستقل لكل عملية بتاريخها ومقدارها فقط.
 
     الصيغة:
         ⛽ محطة محروقات العمر
@@ -239,13 +239,17 @@ def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) ->
 
         📋 العمليات (N):
         [كتلة monospace]
-        #1   سحب   +[X] لتر   ← الرصيد: [التراكمي]
+        #1   DD/MM/YYYY   سحب   +[X] لتر
+
+        #2   DD/MM/YYYY   إيداع  -[X] لتر
         ...
         ────────────────────
         ⚖️ صافي الرصيد: [X] لتر
 
-    الإشارات: السحب «+» (يرفع الرصيد) والإيداع «−» (يخفضه) — والسهم
-    ← معكوس باتجاه «الرصيد:» ليتوافق مع عرض العبارة العربية RTL.
+    الإشارات: السحب «+» (يرفع الرصيد) والإيداع «-» (يخفضه).
+    صيغة 2026-09-05: حُذف «الرصيد التراكمي» من كل سطر (السهم ← كان
+    يشتّت بتكرار الأرقام) وبقي «⚖️ صافي الرصيد» وحده في الختام،
+    وأُضيف تاريخ كل عملية بجانبها مع سطر فارغ يفصل بين العمليات.
     """
     sep = "────────────────────"
     lines = [
@@ -257,10 +261,10 @@ def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) ->
         f"📋 العمليات ({len(activity)}):",
         "",
     ]
-    # الرصيد التراكمي يُحسب من الأقدم زمنياً (activity الأحدث أولاً فنعكسها)،
-    # ثم نعرض بنفس الترتيب التصاعدي — #1 = الأقدم دائماً (إصلاح عكس مزدوج
-    # كان يعرض الأحدث أولاً فيظهر الرصيد تنازلياً  يهبط من صافي اليوم إلى الصفر).
-    running = Decimal("0.000")
+    # الأقدم زمنياً أولاً (activity الأحدث أولاً فنعكسها) — #1 = الأقدم
+    # دائماً (إصلاح عكس مزدوج كان يعرض الأحدث أولاً). صيغة 2026-09-05
+    # بلا رصيد تراكمي نهائياً: كل عملية سطر يحمل تاريخها ومقدارها فقط،
+    # والخلاصة «صافي الرصيد» وحدها في الختام (مقدار موقَّع من القاعدة).
     rows = []
     for r in reversed(activity):
         liters = Decimal(str(r.get("liters") or 0))
@@ -269,31 +273,37 @@ def _render_fuel_statement(name: str, activity: list[dict], balance: Decimal) ->
             liters = -liters
         elif etype == "debit" and liters < 0:
             liters = abs(liters)
-        running += liters
-        rows.append((liters, running))
+        rows.append((liters, r.get("created_at")))
 
     # عرض #1 = الأقدم (بدون reverse — order التصاعدي محفوظ)
     if rows:
         w_idx = max(len(_hi_num(str(i))) for i in range(1, len(rows) + 1))
         w_op = max(len("سحب" if l > 0 else "إيداع") for l, _ in rows)
+        w_dt = max(len(_fmt_dt_compact(ca)) for _, ca in rows)
         # المبلغ مُسبَق بإشارته دائماً: + للسحب (يرفع الرصيد) و- للإيداع (يخفضه)
         w_amt = max(
             len(("+" if l > 0 else "-") + _fmt_liters(abs(l))) for l, _ in rows
         )
-        w_bal = max(len(_fmt_liters(b)) for _, b in rows)
         body = []
-        for idx, (liters, bal) in enumerate(rows, 1):
+        for idx, (liters, created_at) in enumerate(rows, 1):
             op = "سحب" if liters > 0 else "إيداع"
             sign = "+" if liters > 0 else "-"
             amount = f"{sign}{_fmt_liters(abs(liters))}"
+            # LRM (\u200E) في بداية كل سطر: يفرض اتجاه LTR لكل سطر على حدة
+            # (كل سطر فقرة مستقلة في خوارزمية Bidi) — فتثبت الأعمدة ولا
+            # تتقلب ترتيباً على تليجرام الموبايل العربي مهما كان أول حرف.
             body.append(
-                f"#{_hi_num(str(idx)).ljust(w_idx)}   {op.ljust(w_op)}   "
-                f"{amount.rjust(w_amt)} لتر"
-                f"   ← الرصيد: {_fmt_liters(bal).rjust(w_bal)}"
+                "\u200E"
+                f"#{_hi_num(str(idx)).ljust(w_idx)}   "
+                f"{_fmt_dt_compact(created_at).ljust(w_dt)}   "
+                f"{op.ljust(w_op)}   {amount.rjust(w_amt)} لتر"
             )
-        lines.append("```")
-        lines.extend(body)
-        lines.append("```")
+            if idx < len(rows):
+                body.append("")  # مسافة تنفّس بصري بين كل عمليتين
+        # كتلة الكود عبر _code_page: تُحرر القفل وتفتح بعلامة LRM (U+200E)
+        # لفرض الاتجاه LTR — يمنع تقليب أعمدة الكشف على تليجرام الموبايل
+        # العربي (نفس الآلية الثابتة لقوائم النسخ)، وتُعقّم أي ` أو \.
+        lines.append(_code_page(body))
     lines += [
         sep,
         f"⚖️ صافي الرصيد: {_fmt_liters(balance)} لتر",

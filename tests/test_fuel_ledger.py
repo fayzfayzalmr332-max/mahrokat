@@ -459,32 +459,44 @@ def test_show_balance_fuel_only_card(monkeypatch):
 
 
 def test_fuel_statement_oldest_first_and_positive_deposit():
-    """كشف اللترات: #1 = الأقدم + السهم ← نحو الرصيد + إشارات (+/-).
+    """كشف اللترات: #1 = الأقدم + تاريخ كل عملية + إشارات (+/-) بلا سهم.
 
-    انحدار لخلل مزدوج سابق (عرض الأحدث أولاً + الإيداع يظهر سالباً)
-    والتحقق من مواصفات المالك: السهم معكوس باتجاه الرصيد، السحب «+»
-    (يرفع الرصيد) والإيداع «−» (يخفضه).
+    صيغة 2026-09-05: حُذف «← الرصيد التراكمي» من كل سطر وبقي
+    «⚖️ صافي الرصيد» وحده في الختام، وأُضيف تاريخ العملية بجانبها
+    مع سطر فارغ يفصل بين كل عمليتين.
     """
     import app.bot as botmod  # noqa: PLC0415
 
     # activity كما تعيد get_fuel_activity: الأحدث أولاً (created_at.desc)
     # المجموع: 150 - 50 + 30 = 130 (الرصيد الصافي)
     activity = [
-        {"id": "n", "liters": "30", "entry_type": "debit"},      # الأحدث
-        {"id": "l", "liters": "-50", "entry_type": "credit"},    # إيداع 50
-        {"id": "a", "liters": "150", "entry_type": "debit"},     # الأقدم
+        {"id": "n", "liters": "30", "entry_type": "debit",
+         "created_at": "2026-09-02T10:00:00+00:00"},        # الأحدث
+        {"id": "l", "liters": "-50", "entry_type": "credit",
+         "created_at": "2026-09-01T10:00:00+00:00"},      # إيداع 50
+        {"id": "a", "liters": "150", "entry_type": "debit",
+         "created_at": "2026-08-31T10:00:00+00:00"},       # الأقدم
     ]
     out = botmod._render_fuel_statement("زاهر", activity, botmod.Decimal("130"))
-    lines = [l for l in out.splitlines() if l.startswith("#")]
-    # #1 = الأقدم = سحب 150 — والرصيد بعدها 150
-    assert "#1" in lines[0] and "سحب" in lines[0] and "+150 لتر" in lines[0]
-    assert "← الرصيد:" in lines[0] and "150" in lines[0]
-    # الرصيد يتصاعد/ينضبط: آخر سطر = الصافي النهائي (130)
-    assert "130" in lines[-1]
+    raw = out.splitlines()
+    # _code_page تسبق كل سطر بعلامة LRM (U+200E) لفرض الاتجاه LTR — نزيلها للفحص
+    rows_ln = [l.lstrip("\u200E") for l in raw]
+    rows = [l for l in rows_ln if l.startswith("#")]
+    # #1 = الأقدم = سحب 150 — والتاريخ يُعرض بجانب كل عملية
+    assert "#1" in rows[0] and "سحب" in rows[0] and "+150 لتر" in rows[0]
+    assert "31/08/2026" in rows[0]
+    assert "01/09/2026" in rows[1]
+    assert "02/09/2026" in rows[2]
+    # حُذف سهم الرصيد التراكمي نهائياً وبقي الصافي وحده ختاماً
+    assert "←" not in out and "التراكمي" not in out
+    assert "⚖️ صافي الرصيد: 130 لتر" in out
+    # سطر فارغ يفصل بين كل عمليتين
+    idxs = [i for i, ln in enumerate(rows_ln) if ln.startswith("#")]
+    assert len(idxs) == 3
+    assert raw[idxs[0] + 1] == "" and raw[idxs[1] + 1] == ""
     # الإيداع بإشارة سالبة (يخفض الرصيد) — لا موجب ولا بلا إشارة
-    deposit = [l for l in lines if "إيداع" in l][0]
+    deposit = [l for l in rows if "إيداع" in l][0]
     assert "-50 لتر" in deposit
-    assert "← الرصيد:" in deposit
 
 
 def test_show_balance_fuel_only_empty(monkeypatch):
