@@ -579,13 +579,17 @@ def test_persistence_roundtrip_decimal_exact(monkeypatch):
 
 
 def test_reset_accounts_only_keeps_zeroed_balances_structure(monkeypatch):
-    """التصفير يحذف المعاملات والقيود فقط — الأرصدة (مشتقة من الجمع) تصفر."""
+    """التصفير يحذف المعاملات والقيود ودفتر اللترات — الأرصدة تصفر."""
     dbinst = _db()
-    rec = _ReqStub([[], [], [], []])
+    rec = _ReqStub([[], [], [], [], [], []])
     monkeypatch.setattr(dbinst, "_req", rec)
     counts = dbinst.reset_accounts_only()
     deleted = [c for c in rec.calls if c[0] == "DELETE"]
-    assert {c[1] for c in deleted} == {"account_entries", "transactions"}
+    assert {c[1] for c in deleted} == {
+        "account_entries",
+        "transactions",
+        "fuel_ledger",
+    }
     assert counts["customers"] == 0
     assert all(c[1] != "customers" for c in deleted)
     # الفلتر الشامل يستخدم id=neq.0000… ليطابق كل الصفوف الفعلية

@@ -38,8 +38,10 @@ def test_reset_accounts_only_keeps_customers(db, monkeypatch):
         [
             [],  # count transactions
             [],  # count account_entries
+            [],  # count fuel_ledger
             [],  # delete account_entries
             [],  # delete transactions
+            [],  # delete fuel_ledger
         ]
     )
     monkeypatch.setattr(db, "_req", rec)
@@ -47,18 +49,27 @@ def test_reset_accounts_only_keeps_customers(db, monkeypatch):
     # العملاء لم يُطلب عدّهم ولا حذفهم
     assert counts["customers"] == 0
     deleted = [c for c in rec.calls if c[0] == "DELETE"]
-    assert {c[1] for c in deleted} == {"account_entries", "transactions"}
+    assert {c[1] for c in deleted} == {
+        "account_entries",
+        "transactions",
+        "fuel_ledger",
+    }
     # التصفير الشامل يحذف العملاء — وهذا لا يجب أن يحدث هنا
     assert all(c[1] != "customers" for c in deleted)
 
 
 def test_reset_all_data_deletes_everything(db, monkeypatch):
-    rec = _ReqRecorder([[], [], []] * 2)  # عدّ + حذف لثلاثة جداول
+    rec = _ReqRecorder([[], [], [], []] * 2)  # عدّ + حذف لأربعة جداول
     monkeypatch.setattr(db, "_req", rec)
     monkeypatch.setattr(db, "set_setting", lambda k, v: None)
     counts = db.reset_all_data()
     deleted = [c[1] for c in rec.calls if c[0] == "DELETE"]
-    assert set(deleted) == {"account_entries", "transactions", "customers"}
+    assert set(deleted) == {
+        "account_entries",
+        "transactions",
+        "fuel_ledger",
+        "customers",
+    }
     assert counts["customers"] == 0  # من الردود الفارغة
 
 

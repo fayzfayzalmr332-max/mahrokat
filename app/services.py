@@ -688,6 +688,7 @@ class Database:
         customers = data.get("customers") or []
         txs = data.get("transactions") or []
         entries = data.get("account_entries") or []
+        fuel_rows = data.get("fuel_ledger") or []
 
         _, existing = self._req("GET", "customers", "select=id")
         for c in existing:
@@ -745,10 +746,36 @@ class Database:
             self._req("POST", "account_entries", "select=id", payload)
             inserted_entries += 1
 
+        # ── إعادة دفتر اللترات (كان يُفقَد كاملاً بعد الاستعادة — أُصلح) ──
+        inserted_fuel = 0
+        for f in fuel_rows:
+            if "id" not in f or "customer_id" not in f:
+                continue
+            payload = {
+                "id": f["id"],
+                "customer_id": f["customer_id"],
+                "fuel_type": f.get("fuel_type"),
+                "liters": f.get("liters"),
+                "entry_type": f.get("entry_type"),
+                "note": f.get("note"),
+                "created_at": f.get("created_at"),
+            }
+            if f.get("external_ref"):
+                payload["external_ref"] = f["external_ref"]
+            try:
+                self._req("POST", "fuel_ledger", "select=id", payload)
+            except RuntimeError as exc:  # noqa: BLE001 — قاعدة قديمة بلا الجدول
+                logger.warning(
+                    "لا يمكن استعادة سجل اللترات (%s) — جدول قديم بلا fuel_ledger", exc
+                )
+                break
+            inserted_fuel += 1
+
         return {
             "customers": inserted_customers,
             "transactions": inserted_txs,
             "account_entries": inserted_entries,
+            "fuel_ledger": inserted_fuel,
         }
 
     # ── تصدير CSV ───────────────────────────────────────────
@@ -1315,20 +1342,23 @@ class Database:
             return 0
 
     def reset_all_data(self) -> dict:
-        """تصفير كل بيانات المحطة نهائياً (عملاء + معاملات + محاسبي).
+        """تصفير كل بيانات المحطة نهائياً (عملاء + معاملات + محاسبي + لترات).
 
         مسؤولة وخطيرة — لا تُستدعى إلا بعد تأكيد مزدوج صريح من المالك/المحاسب.
-        ترتيب الحذف يحترم القيود المرجعية: القيود المحاسبية ← المعاملات ← العملاء.
+        ترتيب الحذف يحترم القيود المرجعية: القيود المحاسبية ← المعاملات ←
+        دفتر اللترات ← العملاء (كان `fuel_ledger` يُغفَل فيفشل حذف العملاء
+        بقيد ON DELETE RESTRICT عند وجود أي سجل وقود — أُصلح).
         """
         counts = {
             "transactions": self._count_rows("transactions"),
             "customers": self._count_rows("customers"),
             "account_entries": self._count_rows("account_entries"),
+            "fuel_ledger": self._count_rows("fuel_ledger"),
         }
 
         # PostgREST يرفض DELETE بلا فلتر؛ id=neq.zero يطابق كل الصفوف الفعلية
         q = urllib.parse.urlencode({"id": f"neq.{_NULL_UUID}"})
-        for path in ("account_entries", "transactions", "customers"):
+        for path in ("account_entries", "transactions", "fuel_ledger", "customers"):
             try:
                 self._req("DELETE", path, q)
             except RuntimeError as exc:  # noqa: BLE001
@@ -1342,18 +1372,21 @@ class Database:
         return counts
 
     def reset_accounts_only(self) -> dict:
-        """تصفير الحسابات مع إبقاء العملاء: حذف المعاملات والقيود المحاسبية فقط.
+        """تصفير الحسابات مع إبقاء العملاء: حذف المعاملات والقيود المحاسبية
+        ودفتر اللترات فقط.
 
         الأرصدة مشتقة من المعاملات (RPC/Views) لذا تصفّر تلقائياً بحذفها —
-        مناسب لبداية دورة محاسبية جديدة دون فقدان دفتر العملاء.
+        مناسب لبداية دورة محاسبية جديدة دون فقدان دفتر العملاء. كان `fuel_ledger`
+        يُغفَل فتبقى أرصدة اللترات حية بعد «التصفير» — أُصلح ليُمسح معها.
         """
         counts = {
             "transactions": self._count_rows("transactions"),
             "customers": 0,  # العملاء يبقون في هذا الوضع
             "account_entries": self._count_rows("account_entries"),
+            "fuel_ledger": self._count_rows("fuel_ledger"),
         }
         q = urllib.parse.urlencode({"id": f"neq.{_NULL_UUID}"})
-        for path in ("account_entries", "transactions"):
+        for path in ("account_entries", "transactions", "fuel_ledger"):
             try:
                 self._req("DELETE", path, q)
             except RuntimeError as exc:  # noqa: BLE001
