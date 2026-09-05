@@ -35,11 +35,7 @@ _AMOUNT_WORDS = {
     "مليار": 1_000_000_000,
 }
 
-_MULTIPLIER_SINGLE = {
-    "الف": 1000, "ألف": 1000,
-    "مليون": 1_000_000,
-    "مليار": 1_000_000_000,
-}
+
 
 
 def parse_number(raw: str) -> Decimal | None:
