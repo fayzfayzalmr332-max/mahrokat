@@ -628,27 +628,29 @@ def test_statement_exact_approved_customer_template():
     out = _stmt(ledger, "10520", now=(2026, 9, 10, 10, 18))
     assert "🏢 محطة محروقات العمر" in out
     assert "👤 العميل العزيز: عبدو الجداح" in out
-    assert "📅 تاريخ الكشف: 10/09/2026 · 10:18 ص" in out
-    assert "📌 إجمالي المتبقي سداداً: 10,520 ل.س" in out
-    assert "📊 تفاصيل آخر عملياتك:" in out
-    # سحوبات: لا ⬅️ (ينقلب RTL على أندرويد) — فاصلة طويلة آمنة، ورقم مطلق
-    assert "• 31/08/2026 — سحب محروقات بقيمة: 8,000 ل.س" in out
-    assert "• 31/08/2026 — سحب محروقات بقيمة: 7,170 ل.س" in out
-    assert "• 05/09/2026 — سحب محروقات بقيمة: 3,000 ل.س" in out
-    # سداد: ⬇️ فقط (ثابت عمودياً) وبدون سالب ظاهر — «سداد» تشرح الاتجاه
-    assert "• 05/09/2026 ⬇️ تنزيل دفعة (سداد): 15,000 ل.س" in out
+    assert "📅 الكشف: 10/09/2026 · 10:18 ص" in out
+    assert "📌 المتبقي سداداً: 10,520 ل.س" in out
+    assert "📊 آخر عملياتك:" in out
+    # سحوبات: بدون ⬅️⬇️ (تنقلب على واتساب) — نص واضح
+    assert "31/08/2026  سحب محروقات  8,000 ل.س" in out
+    assert "31/08/2026  سحب محروقات  7,170 ل.س" in out
+    assert "05/09/2026  سحب محروقات  3,000 ل.س" in out
+    # سداد: نص واضح بدون ⬇️ — «سداد» تشرح الاتجاه
+    assert "05/09/2026  سداد  15,000 ل.س" in out
     assert "-15,000" not in out
-    assert "• 08/09/2026 — سحب محروقات بقيمة: 7,350 ل.س" in out
-    assert "⚖️ إجمالي المتبقي سداداً: 10,520 ل.س" in out
-    assert "✨ شكراً لثقتكم بمحطة العمر، يسعدنا دائماً خدمتكم." in out
-    assert "🔄 إذا كان لديك استفسار عن أي حركة، راسلنا عليها مباشرة." in out
+    assert "08/09/2026  سحب محروقات  7,350 ل.س" in out
+    assert "⚖️ المتبقي سداداً: 10,520 ل.س" in out
+    assert "✨ شكراً لثقتكم بمحطة العمر" in out
+    assert "🔄 لأي استفسار عن حركة، راسلنا عليها" in out
     # صافي = 8000+7170+3000+7350-15000؛ وبلا رصيد تراكمي لكل سطر (تشتت)
     assert out.index("8,000") < out.index("15,000") < out.index("7,350")
     assert "15,170" not in out and "18,170" not in out
+    # بلا فواصل ═ (تتعطل على واتساب)
+    assert "═" not in out
 
 
 def test_statement_debit_credit_labels_typed():
-    """التسمية مقيدة بنوع الحركة: «سحب» للدين و«تنزيل دفعة (سداد)» للسداد."""
+    """التسمية مقيدة بنوع الحركة: «سحب» للدين و«سداد» للسداد."""
     ledger = [
         {"amount": "500.50", "tx_type": "debit", "created_at": "2026-08-31T13:00:00+00:00"},
         {"amount": "1200.5", "tx_type": "credit", "created_at": "2026-08-31T14:00:00+00:00"},
@@ -656,23 +658,23 @@ def test_statement_debit_credit_labels_typed():
     out = _stmt(ledger, "-700.00")
     for line in out.splitlines():
         if "سحب محروقات" in line:
-            assert "تنزيل" not in line
-        if "تنزيل دفعة" in line:
+            assert "سداد" not in line
+        if "سداد" in line:
             assert "سحب محروقات" not in line
-    assert "— سحب محروقات بقيمة: 500.50 ل.س" in out   # دين يحتفظ بالكسور
-    assert "⬇️ تنزيل دفعة (سداد): 1,200.50 ل.س" in out  # سداد
+    assert "سحب محروقات  500.50 ل.س" in out   # دين يحتفظ بالكسور
+    assert "سداد  1,200.50 ل.س" in out  # سداد
     # الصافي بالقالب الموحد أعلى وأسفل (القيمة المطلقة — لا سالب ظاهر)
-    assert "📌 إجمالي المتبقي سداداً: 700 ل.س" in out
-    assert "⚖️ إجمالي المتبقي سداداً: 700 ل.س" in out
+    assert "📌 المتبقي سداداً: 700 ل.س" in out
+    assert "⚖️ المتبقي سداداً: 700 ل.س" in out
     assert "-700" not in out
 
 
 def test_statement_empty_ledger_branch():
     out = _stmt([], "0.00")
     assert "🕐 لا توجد عمليات مسجلة على هذا الحساب بعد." in out
-    assert "سحب محروقات بقيمة" not in out
-    assert "📌 إجمالي المتبقي سداداً: 0 ل.س" in out
-    assert "⚖️ إجمالي المتبقي سداداً: 0 ل.س" in out
+    assert "سحب محروقات" not in out
+    assert "📌 المتبقي سداداً: 0 ل.س" in out
+    assert "⚖️ المتبقي سداداً: 0 ل.س" in out
 
 
 def test_statement_always_uses_currency_symbol():
@@ -681,8 +683,8 @@ def test_statement_always_uses_currency_symbol():
         {"amount": "7000", "tx_type": "credit", "created_at": "2026-08-31T13:16:00+00:00"},
     ]
     out = _stmt(ledger, "7000.00", currency="")
-    assert "⬇️ تنزيل دفعة (سداد): 7,000 ل.س" in out
-    assert "📌 إجمالي المتبقي سداداً: 7,000 ل.س" in out
+    assert "سداد  7,000 ل.س" in out
+    assert "📌 المتبقي سداداً: 7,000 ل.س" in out
 
 
 def test_statement_truncation_note():
@@ -701,7 +703,7 @@ def test_statement_truncation_note():
 
 def test_statement_net_matches_ledger_sum_fuzz():
     """خصائص عشوائية: صافي الكشف = مجموع الحركات الموقّعة دائماً،
-    وكل سطر يحمل تسمية مطابقة لنوع حركته («سحب»/«تنزيل دفعة»)."""
+    وكل سطر يحمل تسمية مطابقة لنوع حركته («سحب»/«سداد») — بلا رموز اتجاه."""
     import random  # noqa: PLC0415
 
     import app.bot as botmod  # noqa: PLC0415
@@ -723,20 +725,22 @@ def test_statement_net_matches_ledger_sum_fuzz():
             )
         out = _stmt(ledger, str(running_dec), currency="")
         lines = out.splitlines()
-        # الحركات = كل سطر يبدأ بالرصاصة «•»؛ الفواصل ═ خارج النطاق تلقائياً
-        moves = [ln for ln in lines if ln.startswith("•")]
+        # الحركات = كل سطر يحتوي على تاريخ (dd/dd/dddd)
+        moves = [ln for ln in lines if ln.strip() and ln.strip()[:2].isdigit() and "/" in ln]
         assert len(moves) == len(ledger)      # كل حركة لها سطر بالترتيب
         for ln, row in zip(moves, ledger):
             if row["tx_type"] == "credit":
-                assert "⬇️ تنزيل دفعة (سداد)" in ln
+                assert "سداد" in ln
                 assert "سحب" not in ln
             else:
-                assert "— سحب محروقات بقيمة" in ln
-                assert "⬇️" not in ln
+                assert "سحب محروقات" in ln
+                assert "سداد" not in ln
         # الصافي المطلق لكل حركة في سطرها (لا سالب ظاهر في كشف الزبون)
         for ln in moves:
             assert ln.rstrip().endswith("ل.س")
-        assert "-" not in out           # صفر سالب/رمز اتجاه في كشف الزبون
+        assert "═" not in out and "⬇️" not in out and "⬅️" not in out  # بلا رموز اتجاه/فواصل
+        assert "-" not in out           # صفر سالب في كشف الزبون
+        assert botmod._stmt_customer_amount(running_dec) in out  # مطابقة الصافي
         assert botmod._stmt_customer_amount(running_dec) in out  # مطابقة الصافي
 
 
