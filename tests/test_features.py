@@ -616,75 +616,73 @@ def _stmt(ledger, balance, currency="ل.س", now=(2026, 9, 1, 12, 0)):
         object.__setattr__(s, "currency", old)
 
 
-def test_statement_exact_approved_format_zero_balance():
-    """سيناريو المستخدم المرجعي حرفياً: تصفير كامل بعد 4 حركات."""
+def test_statement_exact_approved_customer_template():
+    """النموذج المعتمد حرفياً — سيناريو «عمر النعمه» بالمسودة المعتمدة 2026-09."""
     ledger = [
-        {"amount": "7000", "tx_type": "credit", "created_at": "2026-08-31T13:16:00+00:00"},
-        {"amount": "2000", "tx_type": "credit", "created_at": "2026-08-31T13:18:00+00:00"},
-        {"amount": "1800", "tx_type": "debit", "created_at": "2026-08-31T13:47:00+00:00"},
-        {"amount": "7200", "tx_type": "debit", "created_at": "2026-08-31T18:05:00+00:00"},
+        {"amount": "8000", "tx_type": "debit", "created_at": "2026-08-31T13:00:00+00:00"},
+        {"amount": "7170", "tx_type": "debit", "created_at": "2026-08-31T13:05:00+00:00"},
+        {"amount": "3000", "tx_type": "debit", "created_at": "2026-09-05T13:00:00+00:00"},
+        {"amount": "-15000", "tx_type": "credit", "created_at": "2026-09-05T14:00:00+00:00"},
+        {"amount": "7350", "tx_type": "debit", "created_at": "2026-09-08T13:00:00+00:00"},
     ]
-    out = _stmt(ledger, "0.00")
-    lines = out.splitlines()
-    assert lines[0] == "📊 كشـف الـحـسـاب الـمـالـي"
-    assert "👤 العميل: عبدو الجداح" in out
-    assert "📅 تاريخ الجرد: 01/09/2026" in out
-    assert "⏳ العمليات المسجلة (مرتبة زمنياً من الأقدم إلى الأحدث):" in out
-    # الأسطر الحركية بالصيغة المعتمدة تماماً: 🟢+ للمقبوضات، 🔴- للمسحوبات
-    assert "🟢 7,000.00+ ل.س · 31/08/2026 · 04:16 م" in out
-    assert "🟢 2,000.00+ ل.س · 31/08/2026 · 04:18 م" in out
-    assert "🔴 1,800.00- ل.س · 31/08/2026 · 04:47 م" in out
-    assert "🔴 7,200.00- ل.س · 31/08/2026 · 09:05 م" in out
-    assert "──────────────────" in out
-    assert "💰 الرصيد الصافي الحالي: 0.00 ل.س" in out
-    assert "⚖️ حالة الحساب: مُصفّر بالكامل، شكراً لتعاملكم معنا." in out
-    # ترتيب تصاعدي فعلي: مقبوضات الأقدم قبل مسحوبات الأحدث
-    assert out.index("7,000.00+") < out.index("7,200.00-")
+    out = _stmt(ledger, "10520", now=(2026, 9, 10, 10, 18))
+    assert "🏢 محطة محروقات العمر" in out
+    assert "👤 العميل العزيز: عبدو الجداح" in out
+    assert "📅 تاريخ الكشف: 10/09/2026 · 10:18 ص" in out
+    assert "📌 إجمالي المتبقي سداداً: 10,520 ل.س" in out
+    assert "📊 تفاصيل آخر عملياتك:" in out
+    # سحوبات: لا ⬅️ (ينقلب RTL على أندرويد) — فاصلة طويلة آمنة، ورقم مطلق
+    assert "• 31/08/2026 — سحب محروقات بقيمة: 8,000 ل.س" in out
+    assert "• 31/08/2026 — سحب محروقات بقيمة: 7,170 ل.س" in out
+    assert "• 05/09/2026 — سحب محروقات بقيمة: 3,000 ل.س" in out
+    # سداد: ⬇️ فقط (ثابت عمودياً) وبدون سالب ظاهر — «سداد» تشرح الاتجاه
+    assert "• 05/09/2026 ⬇️ تنزيل دفعة (سداد): 15,000 ل.س" in out
+    assert "-15,000" not in out
+    assert "• 08/09/2026 — سحب محروقات بقيمة: 7,350 ل.س" in out
+    assert "⚖️ إجمالي المتبقي سداداً: 10,520 ل.س" in out
+    assert "✨ شكراً لثقتكم بمحطة العمر، يسعدنا دائماً خدمتكم." in out
+    assert "🔄 إذا كان لديك استفسار عن أي حركة، راسلنا عليها مباشرة." in out
+    # صافي = 8000+7170+3000+7350-15000؛ وبلا رصيد تراكمي لكل سطر (تشتت)
+    assert out.index("8,000") < out.index("15,000") < out.index("7,350")
+    assert "15,170" not in out and "18,170" not in out
 
 
-def test_statement_icons_and_signs_match_tx_types():
-    """الإيموجي والإشارة مقيدان بنوع الحركة لا بموضعها."""
+def test_statement_debit_credit_labels_typed():
+    """التسمية مقيدة بنوع الحركة: «سحب» للدين و«تنزيل دفعة (سداد)» للسداد."""
     ledger = [
-        {"amount": "500", "tx_type": "debit", "created_at": "2026-08-31T13:00:00+00:00"},
+        {"amount": "500.50", "tx_type": "debit", "created_at": "2026-08-31T13:00:00+00:00"},
         {"amount": "1200.5", "tx_type": "credit", "created_at": "2026-08-31T14:00:00+00:00"},
     ]
-    out = _stmt(ledger, "700.50")
-    assert "🔴 500.00- ل.س" in out        # دين → أحمر وسالب
-    assert "🟢 1,200.50+ ل.س" in out      # مقبوضات → أخضر وموجب
-    assert "💰 الرصيد الصافي الحالي: 700.50 ل.س" in out
-    assert "⚖️ حالة الحساب: مدين" in out
-
-
-def test_statement_status_debtor_creditor_variants():
-    debtor = _stmt(
-        [{"amount": "300", "tx_type": "debit", "created_at": "2026-08-31T13:00:00+00:00"}],
-        "300.00",
-    )
-    assert "⚖️ حالة الحساب: مدين — يوجد مبلغ مستحق على العميل." in debtor
-    creditor = _stmt(
-        [{"amount": "450", "tx_type": "credit", "created_at": "2026-08-31T13:00:00+00:00"}],
-        "-450.00",
-    )
-    assert "⚖️ حالة الحساب: دائن — للعميل رصيد مدفوع مسبقاً." in creditor
-    assert "💰 الرصيد الصافي الحالي: -450.00 ل.س" in creditor
+    out = _stmt(ledger, "-700.00")
+    for line in out.splitlines():
+        if "سحب محروقات" in line:
+            assert "تنزيل" not in line
+        if "تنزيل دفعة" in line:
+            assert "سحب محروقات" not in line
+    assert "— سحب محروقات بقيمة: 500.50 ل.س" in out   # دين يحتفظ بالكسور
+    assert "⬇️ تنزيل دفعة (سداد): 1,200.50 ل.س" in out  # سداد
+    # الصافي بالقالب الموحد أعلى وأسفل (القيمة المطلقة — لا سالب ظاهر)
+    assert "📌 إجمالي المتبقي سداداً: 700 ل.س" in out
+    assert "⚖️ إجمالي المتبقي سداداً: 700 ل.س" in out
+    assert "-700" not in out
 
 
 def test_statement_empty_ledger_branch():
     out = _stmt([], "0.00")
-    assert "⏳ لا توجد عمليات مسجلة على هذا الحساب بعد." in out
-    assert "مرتبة زمنياً" not in out       # لا قسم حركات فارغ
-    assert "💰 الرصيد الصافي الحالي: 0.00 ل.س" in out
-    assert "⚖️ حالة الحساب: مُصفّر بالكامل، شكراً لتعاملكم معنا." in out
+    assert "🕐 لا توجد عمليات مسجلة على هذا الحساب بعد." in out
+    assert "سحب محروقات بقيمة" not in out
+    assert "📌 إجمالي المتبقي سداداً: 0 ل.س" in out
+    assert "⚖️ إجمالي المتبقي سداداً: 0 ل.س" in out
 
 
-def test_statement_without_currency_configured():
-    """CURRENCY فارغ → المبالغ بإشارتها فقط بلا لاحقة عملة."""
+def test_statement_always_uses_currency_symbol():
+    """قالب الزبون يعرض «ل.س» دائماً (مطابق النموذج المعتمد حرفياً)."""
     ledger = [
         {"amount": "7000", "tx_type": "credit", "created_at": "2026-08-31T13:16:00+00:00"},
     ]
     out = _stmt(ledger, "7000.00", currency="")
-    assert "🟢 7,000.00+ · 31/08/2026 · 04:16 م" in out
-    assert "💰 الرصيد الصافي الحالي: 7,000.00" in out
+    assert "⬇️ تنزيل دفعة (سداد): 7,000 ل.س" in out
+    assert "📌 إجمالي المتبقي سداداً: 7,000 ل.س" in out
 
 
 def test_statement_truncation_note():
@@ -693,23 +691,17 @@ def test_statement_truncation_note():
     ledger = [
         {"amount": "10", "tx_type": "credit", "created_at": "2026-08-31T13:00:00+00:00"}
     ]
-    s = botmod.env_settings
-    old = getattr(s, "currency", "")
-    object.__setattr__(s, "currency", "")
-    try:
-        out = botmod._render_financial_statement(
-            "عميل", ledger, "10.00",
-            now=botmod.datetime(2026, 9, 1),
-            truncated_from=120,
-        )
-    finally:
-        object.__setattr__(s, "currency", old)
+    out = botmod._render_financial_statement(
+        "عميل", ledger, "10.00",
+        now=botmod.datetime(2026, 9, 1),
+        truncated_from=120,
+    )
     assert "(عرض آخر 1 حركة من إجمالي 120)" in out
 
 
 def test_statement_net_matches_ledger_sum_fuzz():
     """خصائص عشوائية: صافي الكشف = مجموع الحركات الموقّعة دائماً،
-    وكل سطر يحمل أيقونة/إشارة مطابقة لنوع حركته وحالة صحيحة."""
+    وكل سطر يحمل تسمية مطابقة لنوع حركته («سحب»/«تنزيل دفعة»)."""
     import random  # noqa: PLC0415
 
     import app.bot as botmod  # noqa: PLC0415
@@ -718,10 +710,10 @@ def test_statement_net_matches_ledger_sum_fuzz():
     for _case in range(60):
         running_dec = botmod.to_decimal("0")
         ledger = []
-        for n in range(rng.randint(1, 12)):
+        for n in range(rng.randint(1, 15)):
             amt = botmod.to_decimal(str(rng.randint(1, 90000)))
             ttype = rng.choice(["debit", "credit"])
-            running_dec = running_dec + (amt if ttype == "credit" else -amt)
+            running_dec = running_dec + (amt if ttype == "debit" else -amt)
             ledger.append(
                 {
                     "amount": str(amt),
@@ -731,23 +723,21 @@ def test_statement_net_matches_ledger_sum_fuzz():
             )
         out = _stmt(ledger, str(running_dec), currency="")
         lines = out.splitlines()
-        start = next(i for i, ln in enumerate(lines) if ln.startswith("⏳")) + 1
-        sep = lines.index("──────────────────")
-        moves = lines[start:sep]
+        # الحركات = كل سطر يبدأ بالرصاصة «•»؛ الفواصل ═ خارج النطاق تلقائياً
+        moves = [ln for ln in lines if ln.startswith("•")]
         assert len(moves) == len(ledger)      # كل حركة لها سطر بالترتيب
         for ln, row in zip(moves, ledger):
-            assert ln.startswith("🟢") == (row["tx_type"] == "credit")
-            assert ln.startswith("🔴") == (row["tx_type"] == "debit")
-            assert ("+" in ln) == (row["tx_type"] == "credit")
-            assert ("-" in ln) == (row["tx_type"] == "debit")
-        net_line = next(ln for ln in lines if "الرصيد الصافي" in ln)
-        assert f"{running_dec:,.2f}" in net_line  # مطابقة الصافي الحسابية
-        if running_dec > 0:
-            assert "مدين" in out
-        elif running_dec < 0:
-            assert "دائن" in out
-        else:
-            assert "مُصفّر بالكامل" in out
+            if row["tx_type"] == "credit":
+                assert "⬇️ تنزيل دفعة (سداد)" in ln
+                assert "سحب" not in ln
+            else:
+                assert "— سحب محروقات بقيمة" in ln
+                assert "⬇️" not in ln
+        # الصافي المطلق لكل حركة في سطرها (لا سالب ظاهر في كشف الزبون)
+        for ln in moves:
+            assert ln.rstrip().endswith("ل.س")
+        assert "-" not in out           # صفر سالب/رمز اتجاه في كشف الزبون
+        assert botmod._stmt_customer_amount(running_dec) in out  # مطابقة الصافي
 
 
 # ── بطاقة العميل /card ────────────────────────────────────────

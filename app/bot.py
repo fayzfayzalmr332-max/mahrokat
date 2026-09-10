@@ -440,6 +440,22 @@ def _fmt_dt_compact(iso: object) -> str:
     return _fmt_dt(iso, with_time=False)
 
 
+def _fmt_dt_local(now: datetime, with_time: bool = True) -> str:
+    """تنسيق كائن datetime محليّ (ناتج _local_now) مباشرةً — بلا تحويل إضافي.
+
+    إصلاح: كان `_fmt_dt(_local_now().isoformat())` يضاعف انحراف TIMEZONE_OFFSET
+    لأن _local_now يحمل tzinfo=UTC فيُستخدم astimezone فيُزاح مرة ثانية
+    (النتيجة: «تاريخ الجرد» في /card وأعمار الديون وتقرير اليوم خاطئون
+    بساعات وقد ينقلب اليوم) — الآن تُقرأ القيم من الحقول كما هي.
+    """
+    date = f"{now.day:02d}/{now.month:02d}/{now.year}"
+    if not with_time:
+        return date
+    h12 = now.hour % 12 or 12
+    ampm = "ص" if now.hour < 12 else "م"
+    return f"{date} · {h12:02d}:{now.minute:02d} {ampm}"
+
+
 
 def _md(text: object) -> str:
     """هروب النصوص الديناميكية (أسماء/ملاحظات) من كسر صيغة Markdown بتليجرام."""
@@ -2104,7 +2120,7 @@ async def cmd_aging(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         body = "\n\n".join(sections)
         text = (
             f"⏳ *أعمار الديون* — الأقدم أولاً\n"
-            f"🗓️ {_md2(_fmt_dt(_local_now().isoformat(), with_time=False))}\n\n"
+            f"🗓️ {_md2(_fmt_dt_local(_local_now(), with_time=False))}\n\n"
             f"{body}\n\n"
             f"💼 إجمالي الديون: *{_fmt_money_md2(r['total'])}*"
         )
@@ -2216,7 +2232,7 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"💳 الرصيد: {_fmt_money(bal)}",
             f"🔄 عدد الحركات: {_hi_num(count)}",
             f"🕒 آخر نشاط: {_fmt_dt(last) if last else '—'}",
-            f"📅 تاريخ الجرد: {_fmt_dt(_local_now().isoformat())}",
+            f"📅 تاريخ الجرد: {_fmt_dt_local(_local_now())}",
         ]
         if ledger:
             meta.append(f"سجل العمليات الكامل ({len(ledger)} عملية) — الأقدم أولاً:")
@@ -2349,27 +2365,20 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 # ── كشف الحساب المالي الموحّد (الصيغة الهندسية المعتمدة) ──────
-_STMT_SEP = "──────────────────"
+_STMT_SEP = "═" * 30
+_STATION_NAME = "محطة محروقات العمر"
 
 
-def _stmt_amount(amount, tx_type: str) -> str:
-    """المبلغ بإشارته الظاهرة بعد الرقم: «7,000.00+ ل.س» مقبوضات،
-    «1,800.00- ل.س» مسحوبات/ديون — بالفواصل النظيفة ومنزلتين ثابتتين."""
-    d = to_decimal(amount)
-    sign = "-" if tx_type == "debit" else "+"
-    cur = (env_settings.currency or "").strip()
-    body = f"{_hi_num(f'{abs(d):,.2f}')}{sign}"
-    return f"{body} {cur}".strip()
+def _stmt_customer_amount(amount) -> str:
+    """مبلغ كشف الزبون: القيمة المطلقة بلا إشارة ظاهرة «15,000 ل.س».
 
-
-def _stmt_status(balance) -> str:
-    """سطر حالة الحساب بحسب صافي الرصيد (مدين/دائن/مُصفّر)."""
-    d = to_decimal(balance)
-    if d > 0:
-        return "⚖️ حالة الحساب: مدين — يوجد مبلغ مستحق على العميل."
-    if d < 0:
-        return "⚖️ حالة الحساب: دائن — للعميل رصيد مدفوع مسبقاً."
-    return "⚖️ حالة الحساب: مُصفّر بالكامل، شكراً لتعاملكم معنا."
+    صحيح كامل → بلا منازل عشرية («8,000 ل.س»)؛ به كسر → منزلتان
+    («1,200.50 ل.س») — يمنع إسقاط صامت للباقي. العملة «ل.س» ثابتة.
+    """
+    d = abs(to_decimal(amount))
+    if d == d.to_integral_value():
+        return f"{_hi_num(f'{int(d):,}')} ل.س"
+    return f"{_hi_num(f'{d:,.2f}')} ل.س"
 
 
 def _render_financial_statement(
@@ -2380,49 +2389,61 @@ def _render_financial_statement(
     now: datetime | None = None,
     truncated_from: int | None = None,
 ) -> str:
-    """توليد كشف الحساب المالي الموحد — نص صافٍ بلا Markdown
-    (أسماء العملاء تُعرض كما هي بلا أي خطر تهريب صيغة).
+    """كشف حساب العميل بالنموذج المبسّط المعتمد 2026-09 (نصّ صافٍ بلا Markdown).
 
-    الهيكل المعتمد:
-      📊 كشـف الـحـسـاب الـمـالـي
-      👤 العميل: …
-      📅 تاريخ الجرد: 01/09/2026
-      ⏳ العمليات المسجلة (مرتبة زمنياً من الأقدم إلى الأحدث):
-      🟢 7,000.00+ ل.س · 31/08/2026 · 04:16 م
-      🔴 1,800.00- ل.س · 31/08/2026 · 04:47 م
-      ──────────────────
-      💰 الرصيد الصافي الحالي: 0.00 ل.س
-      ⚖️ حالة الحساب: مُصفّر بالكامل، شكراً لتعاملكم معنا.
+    الهيكل الحرفي:
+      🏢 محطة محروقات العمر
+      👤 العميل العزيز: {الاسم}
+      📅 تاريخ الكشف: DD/MM/YYYY · HH:MM ص
+      ══════════════════════════════
+      📌 إجمالي المتبقي سداداً: {المبلغ}
+      ══════════════════════════════
+      📊 تفاصيل آخر عملياتك:
+      • DD/MM/YYYY — سحب محروقات بقيمة: {المبلغ}
+      • DD/MM/YYYY ⬇️ تنزيل دفعة (سداد): {المبلغ}
+      ══════════════════════════════
+      ⚖️ إجمالي المتبقي سداداً: {المبلغ}
+      ✨ شكراً لثقتكم بمحطة العمر، يسعدنا دائماً خدمتكم.
+      🔄 إذا كان لديك استفسار عن أي حركة، راسلنا عليها مباشرة.
 
-    يجب أن تأتي ledger مرتبة تصاعدياً زمنياً (خرج get_ledger)؛ فالترتيب
-    الزمني شرط هندسي للكشف لا مسؤولية العارض.
+    قرارات التبسيط الهندسي-التجاري المعتمدة:
+      - بلا رصيد تراكمي لكل سطر (شتّت الزبون) — الإجمالي أعلى وأسفل فقط.
+      - بلا سهم ⬅️ على السحب (كان ينقلب 180° على بعض أندرويد في RTL)
+        — فاصلة طويلة « — » مكانه.
+      - بلا سالب ظاهر على السداد («تنزيل دفعة (سداد): 15,000» لا «-15,000»)
+        — كلمة «سداد» تشرح الاتجاه وتجنّب «سفر» الناقص في Bidi.
+      - ledger تأتي تصاعدياً زمنياً (خرج get_ledger) — الأقدم أولاً.
     """
     local_now = now or _local_now()
     lines = [
-        "📊 كشـف الـحـسـاب الـمـالـي",
-        f"👤 العميل: {name}",
-        f"📅 تاريخ الجرد: {_hi_num(f'{local_now.day:02d}/{local_now.month:02d}/{local_now.year}')}",
-        "",
+        f"🏢 {_STATION_NAME}",
+        f"👤 العميل العزيز: {name}",
+        f"📅 تاريخ الكشف: {_fmt_dt_local(local_now)}",
+        _STMT_SEP,
+        f"📌 إجمالي المتبقي سداداً: {_stmt_customer_amount(balance)}",
+        _STMT_SEP,
+        "📊 تفاصيل آخر عملياتك:",
     ]
     if not ledger:
-        lines.append("⏳ لا توجد عمليات مسجلة على هذا الحساب بعد.")
+        lines.append("🕐 لا توجد عمليات مسجلة على هذا الحساب بعد.")
     else:
-        lines.append("⏳ العمليات المسجلة (مرتبة زمنياً من الأقدم إلى الأحدث):")
         if truncated_from:
             lines.append(
-                f"   (عرض آخر {_hi_num(str(len(ledger)))} حركة"
+                f"(عرض آخر {_hi_num(str(len(ledger)))} حركة"
                 f" من إجمالي {_hi_num(str(truncated_from))})"
             )
         for r in ledger:
-            icon = "🟢" if r.get("tx_type") == "credit" else "🔴"
-            lines.append(
-                f"{icon} {_stmt_amount(r.get('amount', 0), r.get('tx_type', ''))}"
-                f" · {_fmt_dt(r.get('created_at'))}"
-            )
+            date_s = _fmt_dt_compact(r.get("created_at"))
+            amt = _stmt_customer_amount(r.get("amount") or 0)
+            if r.get("tx_type") == "credit":
+                lines.append(f"• {date_s} ⬇️ تنزيل دفعة (سداد): {amt}")
+            else:
+                lines.append(f"• {date_s} — سحب محروقات بقيمة: {amt}")
     lines += [
         _STMT_SEP,
-        f"💰 الرصيد الصافي الحالي: {_fmt_money(balance)}",
-        _stmt_status(balance),
+        f"⚖️ إجمالي المتبقي سداداً: {_stmt_customer_amount(balance)}",
+        f"✨ شكراً لثقتكم بمحطة العمر، يسعدنا دائماً خدمتكم.",
+        "🔄 إذا كان لديك استفسار عن أي حركة، راسلنا عليها مباشرة.",
     ]
     return "\n".join(lines)
 
@@ -2953,7 +2974,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     try:
         t = db.today_summary()
-        today_ar = _fmt_dt(_local_now().isoformat(), with_time=False)
+        today_ar = _fmt_dt_local(_local_now(), with_time=False)
         table = _mono_table(
             ["البند", "القيمة"],
             [
