@@ -106,12 +106,6 @@ jobs:
         with:
           version: latest
 
-      - name: ربط المشروع
-        run: supabase link --project-ref "$SUPABASE_PROJECT_ID"
-        env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
-
       - name: فحص مسبق لكلمة مرور قاعدة البيانات (تنظيف الحواف + حارس الفراغ)
         env:
           SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
@@ -128,10 +122,14 @@ jobs:
           echo "تم التنظيف — طول كلمة المرور: ${#TRIMMED} حرفاً (القيمة نفسها لا تُعرض أبداً)"
           echo "SUPABASE_DB_PASSWORD=$TRIMMED" >> "$GITHUB_ENV"
 
-      - name: دفع الترحيلات
-        run: supabase db push --include-all
+      - name: ربط المشروع
+        run: |
+          supabase link --project-ref "${SUPABASE_PROJECT_ID}"
+          supabase db push --include-all --debug
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
 
       - name: تلميح التشخيص عند فشل النشر
         if: failure()
