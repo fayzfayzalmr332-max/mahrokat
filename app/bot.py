@@ -2820,15 +2820,23 @@ async def _render_history_page(
     chunk = rows[page * HISTORY_PAGE_SIZE : (page + 1) * HISTORY_PAGE_SIZE]
     bal = db.get_balance(customer_id)
 
-    lines = [f"🧾 *سجل معاملات {_md(customer_name)}* — صفحة {page + 1}/{pages}", ""]
+    lines = [
+        f"🏢 {_STATION_NAME}",
+        "",
+        f"👤 العميل العزيز: {customer_name}",
+        f"📄 صفحة {page + 1}/{pages}",
+        "",
+    ]
     for r in chunk:
         amt = to_decimal(r.get("amount", 0))
-        kind = "دين" if r.get("tx_type") == "debit" else "سداد"
-        note = f" · {_md(r.get('note'))}" if r.get("note") else ""
-        ts = str(r.get("created_at", ""))[:16]
-        lines.append(f"• {kind} {_fmt_money(abs(amt))}{note} ─ {ts}")
+        ts = _fmt_dt_compact(r.get("created_at"))
+        note = f"  ({r.get('note')})" if r.get("note") else ""
+        if r.get("tx_type") == "credit":
+            lines.append(f"{ts}  سداد  {_stmt_customer_amount(amt)}{note}")
+        else:
+            lines.append(f"{ts}  سحب محروقات  {_stmt_customer_amount(amt)}{note}")
     lines.append("")
-    lines.append(f"⚖️ الرصيد الحالي: *{_fmt_money(bal)}*")
+    lines.append(f"⚖️ المتبقي سداداً: {_stmt_customer_amount(bal)}")
 
     nav = []
     if page > 0:
@@ -2850,12 +2858,11 @@ async def _render_history_page(
         await _safe_message_edit(
             message_to_edit,
             text,
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=markup,
         )
     else:
         await update.effective_message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
+            text, reply_markup=markup
         )
 # ── بناء التطبيق ─────────────────────────────────────────────
 
