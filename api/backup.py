@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -61,11 +60,17 @@ def _backup_filename() -> str:
     return f"fuelstation_backup_{time.strftime('%Y-%m-%d')}.json"
 
 
-async def _run_backup() -> None:
+def _local_now_str() -> str:
+    """وقت المحطة الفعلي (TIMEZONE_OFFSET) — كان UTC يُسمّى «توقيت المحطة» خطأً."""
+    local_ts = time.time() + settings.timezone_offset * 3600
+    return time.strftime("%d/%m/%Y %H:%M", time.localtime(local_ts))
+
+
+async def _run_backup(application=None) -> None:
     """توليد اللقطة الكاملة وإرسالها للمالك كوثيقة JSON."""
     from app.services import db
 
-    application = get_application()
+    application = application or get_application()
     await application.initialize()  # idempotent — مرة واحدة لكل عقدة دافئة
 
     data = db.list_all_data()
@@ -77,7 +82,7 @@ async def _run_backup() -> None:
     owner_id = int(settings.owner_telegram_id)
     caption = (
         f"💾 النسخ الاحتياطي اليومي التلقائي\n"
-        f"📅 {time.strftime('%d/%m/%Y %H:%M')} (توقيت المحطة)\n"
+        f"📅 {_local_now_str()} (توقيت المحطة)\n"
         f"👥 عملاء: {len(data.get('customers', []))} · "
         f"💳 حركات: {len(data.get('transactions', []))} · "
         f"⛽ لترات: {len(data.get('fuel_ledger', []))}"

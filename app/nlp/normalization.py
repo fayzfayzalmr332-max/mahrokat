@@ -16,8 +16,11 @@ import unicodedata
 
 # التشكيل والتنوين وعلامات الإعراب + المدة (ـ)
 _DIACRITICS_AND_TATWEEL = re.compile(r"[\u064B-\u0652\u0670\u0640]+")
-# فاصل عشري بين رقمين (12.5 / 12٫5) — مبالغ مالية يجب ألا تتفكك أبداً
-_DECIMAL_BETWEEN_DIGITS = re.compile(r"(?<=\d)[.\u066B](?=\d)")
+# فاصل عشري بين رقمين (12.5 / 12٫5 / 12,5) — مبالغ مالية يجب ألا تتفكك أبداً
+_DECIMAL_BETWEEN_DIGITS = re.compile(r"(?<=\d)[.\u066B,](?=\d)")
+# فاصلة آلاف بين مجموعة ثلاثية (1,500 / 12,500) — تُزال فتُقرأ 1500 لا 1
+# (كانت تُقتل في التطبيع فيتسجل «1,500» كـ 1 — خطأ مالي جسيم، أُصلح)
+_THOUSANDS_SEP = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
 # حارس مؤقت من منطقة الاستخدام الخاص يعبر التطبيع سالماً ثم يُعاد إلى «.»
 _DECIMAL_SENTINEL = "\ue000"
 # أي شيء ليس حرفاً عربياً أو رقم أو مسافة أو حارس الفاصل العشري يُستبدل بمسافة
@@ -42,6 +45,8 @@ def normalize_arabic(text: str) -> str:
     """
     s = unicodedata.normalize("NFC", text or "")
     s = _DIACRITICS_AND_TATWEEL.sub("", s)
+    # فاصلة الآلاف أولاً (1,500 → 1500) ثم حماية العشري (12,5 → 12.5)
+    s = _THOUSANDS_SEP.sub("", s)
     s = _DECIMAL_BETWEEN_DIGITS.sub(_DECIMAL_SENTINEL, s)
     s = "".join(CHAR_MAP.get(ch, ch) for ch in s)
     s = _NON_WORD.sub(" ", s)

@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -53,8 +52,8 @@ def _is_authorized_cron() -> tuple[bool, str]:
     return False, "missing cron identity"
 
 
-async def _run_alert() -> None:
-    application = get_application()
+async def _run_alert(application=None) -> None:
+    application = application or get_application()
     await application.initialize()  # idempotent — مرة واحدة لكل عقدة دافئة
     try:
         # SimpleNamespace يحاكي context الذي تتوقعه _weekly_alert_job

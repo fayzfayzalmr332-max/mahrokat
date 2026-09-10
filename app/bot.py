@@ -965,6 +965,23 @@ async def _guard(update: Update) -> None:
         pass
 
 
+def _has_money_intent(low: str) -> bool:
+    """هل النص يحمل عملية مالية (دين/سداد/حساب/قيد)؟ — يمنع التوجيه للتقارير.
+
+    إصلاح جسيم: كانت أفعال السداد (سدد/سداد/تسديد/واصل) وأفعال القيد
+    (دخل/مصروف) غائبة عن القائمة، فتُبتلع «سدد محمد 100 اليوم» في تقرير
+    اليوم **دون تسجيل المبلغ إطلاقاً** — والمالك يظن أنه سجّل سداداً!
+    """
+    return any(
+        w in low
+        for w in (
+            "دين ", "دفع", "حساب", "صافي", "مدين", "حمل ",
+            "سدد", "سداد ", "تسديد", "واصل ", "تسليم ",
+            "دخل ", "مصروف", "ايراد", "انفاق",
+        )
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_authorized(update):
         await _guard(update)
@@ -988,17 +1005,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── أوامر إدارية نصية سريعة (بدون شرطة slash) ───────────
     low = text.strip().lower()
-    has_money = any(w in low for w in ("دين ", "دفع", "حساب", "صافي"))
+    has_money = _has_money_intent(low)
     if any(w in low for w in ("قائمة", "الكل", "العملاء")) and not has_money:
         return await cmd_list(update, context)
+    # العبارة الحرفية «تقرير اليوم» تفتح تقرير اليوم — قبل عامّ «تقرير»
+    # (كانت تسقط في الإحصائيات خطأً بخلاف الزر «📅 تقرير اليوم» المربوط)
+    if ("تقرير اليوم" in low or low == "اليوم") and not has_money:
+        return await cmd_today(update, context)
     if any(w in low for w in ("تقرير", "إحصاء", "احصاء", "إحصائيات", "الأرقام")) and not has_money:
         return await cmd_stats(update, context)
     # الصافي دين / المدفوعات
     if "ديون" in low or "المستحق" in low or low == "دين":
         return await cmd_debts(update, context)
-    if any(w in low for w in ("مدفوع", "سددوا", "السداديات")):
+    if any(w in low for w in ("مدفوع", "سددوا", "السداديات")) or low in ("السداد", "سداد"):
         return await cmd_paid(update, context)
-    # تقرير اليوم
+    # تقرير اليوم (بأي صيغة أخرى تحوي «اليوم» و«ليست عملية مالية»)
     if "اليوم" in low and not has_money:
         return await cmd_today(update, context)
     # أكبر المدينين
@@ -3136,11 +3157,18 @@ async def handle_restore_confirm(update: Update, context: ContextTypes.DEFAULT_T
         return
     try:
         result = db.restore_snapshot(pending)
+        fuel_note = (
+            f"\n⛽ لترات: {result.get('fuel_ledger', 0)}"
+            if "fuel_ledger" in result
+            else ""
+        )
         await _safe_edit(
             query,
             f"✅ تمت الاستعادة بنجاح.\n"
             f"👥 عملاء: {result['customers']}\n"
-            f"🔄 معاملات: {result['transactions']}",
+            f"🔄 معاملات: {result['transactions']}\n"
+            f"🧾 قيود: {result.get('account_entries', 0)}"
+            f"{fuel_note}",
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("فشل تنفيذ الاستعادة")
@@ -3172,6 +3200,9 @@ def build_application(settings: Settings) -> Application:
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         per_chat=True,
         per_user=True,
+        # تصريح صريح بالنمط الافتراضي: يُسكت التحذير الرسمي PTBUserWarning
+        # عن «CallbackQueryHandler لن يُتتبَّع لكل رسالة» — سلوك مقصود وموثّق.
+        per_message=False,
     )
 
     app = (

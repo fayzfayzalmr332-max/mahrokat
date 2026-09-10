@@ -8,8 +8,10 @@
 ## الخطوة 0 — قبل البدء (دقيقة واحدة)
 
 - أنشئ مشروعاً جديداً على [supabase.com](https://supabase.com) (أو استخدم مشروعك الحالي).
-- تأكد أن `.env` يحوي: `SUPABASE_URL`، `SUPABASE_SERVICE_KEY` (service_role — سرّي تماماً)،
-  `OWNER_TELEGRAM_ID`، `TIMEZONE_OFFSET`، و`CURRENCY` (اختياري — مثل `ل.س`).
+- تأكد من حقن المتغيرات في **منصة الاستضافة فقط** (لا ملف `.env` مرفوع — التطبيق
+  لا يقرأ `.env`): `SUPABASE_URL`، `SUPABASE_SERVICE_ROLE_KEY` (service_role — سرّي
+  تماماً)، `TELEGRAM_BOT_TOKEN`، `OWNER_TELEGRAM_ID`، واختيارياً `ACCOUNTANT_TELEGRAM_ID`
+  و`TIMEZONE_OFFSET` و`CURRENCY` (مثل `ل.س`).
 
 ## الخطوة 1 — فتح SQL Editor
 

@@ -26,7 +26,8 @@ from app.nlp.normalization import normalize_arabic
 
 # ── مفردات الأفعال (قابلة للتوسيع) ───────────────────────────
 DEBIT_VERBS = ("دين", "علي", "حمل", "تحمل", "مدين")
-CREDIT_VERBS = ("دفع", "واصل", "سدد", "تسليم")
+# «سداد» و«تسديد» أُضيفتا: كانتا غائبتين فـ«سداد محمد 100» لم تُفهم إطلاقاً
+CREDIT_VERBS = ("دفع", "واصل", "سدد", "سداد", "تسديد", "تسليم")
 BALANCE_VERBS = ("حساب", "صافي", "رصيد", "باقي", "كم")
 # أفعال المحاسبي الشخصي (صندوق المالك) — كلمات مميزة لا تتصادم مع ديون العملاء
 INCOME_VERBS = ("دخل", "ايراد", "ارباح", "قبض")
@@ -72,7 +73,9 @@ def _split_words(text: str) -> list[str]:
     words = [t for t in _TOKEN_SEP.split(text) if t]
     cleaned: list[str] = []
     for w in words:
-        if w in CLOSE_WORDS:
+        # كلمات الإغلاق حتى بواو العطف («وشكرا» = شكراً) تُنهي الجملة —
+        # كانت تلتصق باسم العميل («علي وشكرا») فتُنشأ عميل بلا معنى.
+        if w in CLOSE_WORDS or (w.startswith("و") and len(w) > 1 and w[1:] in CLOSE_WORDS):
             break
         cleaned.append(w)
     return cleaned

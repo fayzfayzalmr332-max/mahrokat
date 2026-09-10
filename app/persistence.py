@@ -59,6 +59,9 @@ def _parse_conversations(raw: Any) -> dict:
             parts = str(key).split(":")
             if len(parts) == 2 and parts[0].lstrip("-").isdigit() and parts[1].lstrip("-").isdigit():
                 fixed[(int(parts[0]), int(parts[1]))] = state
+            elif len(parts) == 3 and all(p.lstrip("-").isdigit() for p in parts):
+                # مفاتيح مركّبة (مثل restore:<chat>:<user>) — تُفكّ صحيحاً بدل أن تُفقد
+                fixed[(int(parts[0]), int(parts[1]), int(parts[2]))] = state
             else:
                 fixed[key] = state
         out[name] = fixed

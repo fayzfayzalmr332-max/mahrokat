@@ -12,6 +12,7 @@ numeric(15,2). لا نستخدم float في التخزين إطلاقاً.
 from __future__ import annotations
 
 import logging
+import re
 import time
 import urllib.parse
 
@@ -109,6 +110,28 @@ def _embedded_name(embedded) -> str:
     return "؟"
 
 
+# ── حارس فئة «ORDER BY الديناميكي» (دفاع متعمق) ─────────────
+# كل قيم order في الكود اليوم ثوابت مُبرمجة، لكن هذا الحارس يجعل من
+# المستحيل هيكلياً مرور أي عمود/اتجاه غير متوقع مستقبلاً عبر query string.
+_ORDER_TERM_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.(asc|desc))?$")
+
+
+def _validate_order(query: str) -> None:
+    """يرفض أي `order=` في الاستعلام لا يطابق قائمة السماح الصارمة.
+
+    الصيغ المقبولة: `name` أو `balance.desc` أو `created_at.desc,id.desc`.
+    أي محاولة حقن (فاصلة منقوطة، مسافة، رموز تشغيل) تُرفض فوراً قبل الإرسال.
+    """
+    for part in (query or "").split("&"):
+        if part.startswith("order="):
+            raw = urllib.parse.unquote(part.split("=", 1)[1])
+            for term in raw.split(","):
+                if not _ORDER_TERM_RE.fullmatch(term.strip()):
+                    raise RuntimeError(
+                        f"قيمة order غير مسموح بها: {term.strip()!r} — مرفوضة دفاعياً"
+                    )
+
+
 class Database:
     """غلاف فوق PostgREST عبر HTTP مباشر (متوافق مع أي مفتاح: JWT أو sb_...).
 
@@ -141,6 +164,7 @@ class Database:
         base = self._base or self._get_base()
         url = f"{base}/rest/v1/{path}"
         if query:
+            _validate_order(query)  # حارس دفاعي: لا order ديناميكي غير مفلتر
             url += f"?{query}"
         req_headers = {
             "apikey": settings.supabase_service_role_key,
@@ -625,7 +649,8 @@ class Database:
                 )
                 moved += 1
         except RuntimeError:
-            pass  # جدول الوقود قد يكون غير مُهيأ
+            # المسار القديم بلا جدول الوقود — سلوك مقصود، يُسجَّل السبب
+            logger.debug("لا جدول fuel_ledger عند دمج العميل %s — نكمل", source_id, exc_info=True)
 
         # حذف المصدر بعد نقل كل شيء
         self.delete_customer(source_id, confirm=True)
@@ -654,7 +679,7 @@ class Database:
                 "select=id,entry_type,amount::text,note,category,created_at",
             )
         except RuntimeError:  # noqa: BLE001
-            entries = []
+            logger.debug("تعذّر جلب القيود المحاسبية في اللقطة (قاعدة قديمة) — []", exc_info=True)
         # دفتر اللترات (ترحيل 006): أُدرج بأمان — قاعدة قديمة بلا الجدول تعيد []
         try:
             _, fuel = self._req(
@@ -700,7 +725,9 @@ class Database:
             for e in existing_entries:
                 self.delete_account_entry(e["id"])
         except RuntimeError:  # noqa: BLE001
-            pass
+            logger.debug(
+                "تعذّر تنظيف account_entries قبل الاستعادة (قديم/غائب — نكمل)", exc_info=True
+            )
 
         inserted_customers = 0
         for c in customers:
@@ -909,7 +936,8 @@ class Database:
                 ledger.append(item)
             return ledger
         except RuntimeError:  # noqa: BLE001
-            pass
+            # تراجع صريح للحساب المحلي — يُسجَّل السبب ولا يُبتلع بصمت
+            logger.debug("تعذّر استخدام v_customer_ledger — سنحسب التراكمة محلياً", exc_info=True)
 
         # مسار بديل: حساب محلي قطعي (الأقدم أولاً) — يحافظ على نفس المعنى.
         newest_first = self.get_activity(customer_id, limit=10_000)
@@ -1551,6 +1579,9 @@ class Database:
 
         يعتمد على last_activity_at إن وُجد فقط؛ من لا سجل له يُستبعد
         حتى لا تُرتكب أخطاء بالإنذار عن عملاء قديمة لم تُلمس بعد ترقية.
+
+        أداء: كانت الأرصدة تُجلب صفاً-صف (N+1)؛ الآن طلب View واحد
+        (v_customer_balances) للجميع — مع مسار بديل قديم عند غياب الـ View.
         """
         today = datetime.now(timezone.utc).date()
         q = urllib.parse.urlencode(
@@ -1564,6 +1595,30 @@ class Database:
         except RuntimeError as exc:  # noqa: BLE001
             logger.warning("فشل جلب قائمة العملاء لغير النشطين: %s", exc)
             return []
+
+        # أرصدة كل العملاء في طلب واحد — يلغي N+1 في التنبيه الأسبوعي
+        balances: dict[str, Decimal] = {}
+        fallback_per_customer = False
+        if with_balance:
+            try:
+                bq = urllib.parse.urlencode(
+                    {
+                        "select": "id,balance::text",
+                        "order": "name",
+                        "limit": "1000",
+                    }
+                )
+                _, brow = self._req("GET", "v_customer_balances", bq)
+                for b in brow or []:
+                    try:
+                        balances[b["id"]] = to_decimal(b.get("balance") or 0)
+                    except ValueError:  # noqa: BLE001
+                        balances[b["id"]] = to_decimal("0.00")
+            except RuntimeError as exc:
+                logger.warning(
+                    "تعذّر استخدام v_customer_balances (%s) — مسار بديل قديم", exc
+                )
+                fallback_per_customer = True
 
         inactive: list[dict] = []
         for c in rows:
@@ -1580,10 +1635,13 @@ class Database:
             if days_since < days:
                 continue
             if with_balance:
-                try:
-                    c["balance"] = self.get_balance(c["id"])
-                except RuntimeError:  # noqa: BLE001
-                    c["balance"] = to_decimal("0.00")
+                if fallback_per_customer:
+                    try:
+                        c["balance"] = self.get_balance(c["id"])
+                    except RuntimeError:  # noqa: BLE001
+                        c["balance"] = to_decimal("0.00")
+                else:
+                    c["balance"] = balances.get(c["id"], to_decimal("0.00"))
             c["inactive_days"] = max(0, days_since)
             inactive.append(c)
 

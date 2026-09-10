@@ -987,16 +987,251 @@ def test_backup_snapshot_survives_missing_fuel_table():
     assert snap["fuel_ledger"] == [] and snap["version"] == 3
 
 
-def test_backup_cron_schedule_midnight_station_time():
-    """الجدولة: 21:00 UTC = 12 منتصف الليل بتوقيت المحطة (+3) — نقطة /api/backup."""
+def test_backup_cron_schedule_unified_daily():
+    """الجدولة الموحّدة: مسار cron يومي وحيد (/api/scheduler) — حد Vercel Hobby.
+
+    كان vercel.json يعرّف مهمتين يومياً بينما الخطة المجانية تسمح بـ Trigger
+    وحيد — فلا يُنفّذ إحداهما أو يُرفض النشر. الآن مهمة واحدة تُنفّذ
+    (تنبيه غير النشطين + النسخ الاحتياطي بعلامة تفرد يومية).
+    """
     with open("vercel.json", encoding="utf-8") as f:
         config = json.load(f)
     crons = {c["path"]: c["schedule"] for c in config["crons"]}
-    assert crons.get("/api/backup") == "0 21 * * *"
-    # التنبيه الموجود لم يُمس
-    assert crons.get("/api/alert") == "0 9 * * *"
-    # الدالة الثالثة مسجلة للنشر
+    assert len(crons) == 1  # ضمن حد Hobby: Trigger يومي وحيد
+    assert crons.get("/api/scheduler") == "0 9 * * *"
+    # الدوال مسجلة للنشر — المجدول الموحّد + النقاط اليدوية لم تُمس
+    assert "api/scheduler.py" in config["functions"]
     assert "api/backup.py" in config["functions"]
+    assert "api/alert.py" in config["functions"]
+
+
+# ═════════════════════════════════════════════════════════════
+# انحدارات إصلاح الجلسة: الاستعادة + المجدول الموحّد
+# ═════════════════════════════════════════════════════════════
+def test_restore_snapshot_restores_fuel_ledger():
+    """انحدار: كانت الاستعادة تُسقط دفتر اللترات كاملاً رغم وجوده في اللقطة."""
+    from app.services import Database
+
+    d = Database()
+    calls: list[tuple] = []
+
+    def fake_req(method, path, query="", payload=None, headers=None):
+        calls.append((method, path, payload))
+        return 200, []
+
+    d._req = fake_req
+    snap = {
+        "customers": [{"id": "c1", "name": "محمد", "name_normalized": "محمد"}],
+        "transactions": [
+            {"id": "t1", "customer_id": "c1", "amount": "500",
+             "tx_type": "debit", "created_at": "2026-01-01T00:00:00+00:00"}
+        ],
+        "account_entries": [],
+        "fuel_ledger": [
+            {"id": "f1", "customer_id": "c1", "fuel_type": "mazot",
+             "liters": "12.5", "entry_type": "debit",
+             "created_at": "2026-01-02T00:00:00+00:00", "external_ref": "auto:x"}
+        ],
+    }
+    result = d.restore_snapshot(snap)
+    assert result["fuel_ledger"] == 1
+    fuel_posts = [c for c in calls if c[0] == "POST" and c[1] == "fuel_ledger"]
+    assert len(fuel_posts) == 1
+    assert fuel_posts[0][2]["liters"] == "12.5"
+    assert fuel_posts[0][2]["external_ref"] == "auto:x"
+
+
+def test_restore_snapshot_survives_missing_fuel_table():
+    """قاعدة قديمة بلا جدول fuel_ledger → الاستعادة تُكمل (نقد وقيود وعملاء)."""
+    from app.services import Database
+
+    d = Database()
+
+    def fake_req(method, path, query="", payload=None, headers=None):
+        if path == "fuel_ledger":
+            raise RuntimeError("Supabase HTTP 404: fuel_ledger (قاعدة قديمة)")
+        return 200, []
+
+    d._req = fake_req
+    snap = {
+        "customers": [{"id": "c1", "name": "محمد", "name_normalized": "محمد"}],
+        "transactions": [],
+        "account_entries": [],
+        "fuel_ledger": [
+            {"id": "f1", "customer_id": "c1", "fuel_type": "mazot",
+             "liters": "5", "entry_type": "debit"}
+        ],
+    }
+    result = d.restore_snapshot(snap)
+    assert result["fuel_ledger"] == 0
+    assert result["customers"] == 1
+
+
+def test_scheduler_rejects_unauthorized():
+    """حارس أمان المجدول الموحّد: بلا هوية cron → 401 فوراً."""
+    from flask.testing import FlaskClient
+
+    import api.scheduler as sched
+
+    mp = pytest.MonkeyPatch()
+    mp.setenv("CRON_SECRET", "s3cret")
+    client = FlaskClient(sched.app, sched.app.response_class)
+    assert client.get("/api/scheduler").status_code == 401
+    r = client.get("/api/scheduler", headers={"Authorization": "Bearer wrong"})
+    assert r.status_code == 401
+    mp.undo()
+
+
+def test_scheduler_runs_alert_and_backup_with_daily_dedup(monkeypatch):
+    """السرّ الصحيح → يُنفّذ التنبيه + النسخ الاحتياطي ويكتب علامة التفرد اليومية."""
+    from flask.testing import FlaskClient
+
+    import api.runtime as rt
+    import api.scheduler as sched
+
+    monkeypatch.setenv("CRON_SECRET", "s3cret")
+    settings_store: dict = {}
+
+    class _FakeApp:
+        bot = None
+
+        async def initialize(self):
+            pass
+
+    monkeypatch.setattr(sched, "get_application", lambda: _FakeApp())
+    monkeypatch.setattr(sched.db, "get_setting", lambda k: settings_store.get(k, ""))
+    monkeypatch.setattr(
+        sched.db, "set_setting", lambda k, v: settings_store.__setitem__(k, v)
+    )
+    ran = {"alert": 0, "backup": 0}
+
+    async def fake_alert(context):
+        ran["alert"] += 1
+
+    async def fake_backup(app=None):
+        ran["backup"] += 1
+
+    monkeypatch.setattr(sched, "_weekly_alert_job", fake_alert)
+    monkeypatch.setattr(sched, "_run_backup", fake_backup)
+    monkeypatch.setattr(rt, "run_coro", lambda coro: coro.close())
+
+    client = FlaskClient(sched.app, sched.app.response_class)
+    r = client.get("/api/scheduler", headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 200
+    assert r.get_json()["ok"] is True
+    assert ran == {"alert": 1, "backup": 1}
+    # علامة تفرد النسخ الاحتياطي اليومي كُتبت — إعادة الاستدعاء لن تكرر النسخ
+    assert "scheduler_backup_date" in settings_store
+
+
+# ═════════════════════════════════════════════════════════════
+# انحدارات التوجيه وأرقام الفواصل (NLP)
+# ═════════════════════════════════════════════════════════════
+def test_has_money_intent_blocks_payment_swallow():
+    """انحدار توجيه جسيم: «سدد محمد 100 اليوم» كان يفتح تقرير اليوم دون تسجيل."""
+    from app.bot import _has_money_intent
+
+    # عمليات مالية — يجب ألا تُبتلع في التقارير
+    assert _has_money_intent("سدد محمد 100 اليوم") is True
+    assert _has_money_intent("تسديد علي 50 اليوم") is True
+    assert _has_money_intent("سداد محمد 100") is True
+    assert _has_money_intent("مصروف كهرباء 120 اليوم") is True
+    assert _has_money_intent("دخل كاش 500") is True
+    assert _has_money_intent("دين محمد 50") is True
+    assert _has_money_intent("دفع علي 100") is True
+    # عبارات التقارير تبقى بلا نية مالية
+    assert _has_money_intent("تقرير اليوم") is False
+    assert _has_money_intent("الديون") is False
+    assert _has_money_intent("السداديات") is False
+    assert _has_money_intent("قائمة العملاء") is False
+
+
+def test_parse_thousands_separator_not_swallowed():
+    """انحدار مالي: «دين محمد 1,500» كان يُسجَّل 1 — فاصلة الآلاف تُقتل في التطبيع."""
+    from app.nlp.parser import parse_message
+
+    assert parse_message("دين محمد 1,500").amount == Decimal("1500")
+    assert parse_message("دين محمد 12,500").amount == Decimal("12500")
+    assert parse_message("دين محمد 1,500.25").amount == Decimal("1500.25")
+
+
+def test_parse_decimal_comma_still_works():
+    """الفاصلة العشرية (منزلة-منزلتان بعد الفاصلة) تُقرأ عشرية — لا تتأثر بإصلاح الآلاف."""
+    from app.nlp.parser import parse_message
+
+    assert parse_message("دين محمد 12,5").amount == Decimal("12.5")
+
+
+def test_parse_sadad_tasdid_credit_verbs():
+    """«سداد/تسديد» كانتا غير مفهومتين إطلاقاً (ليستا ضمن أفعال السداد)."""
+    from app.nlp.parser import parse_message
+
+    r = parse_message("سداد محمد 100")
+    assert r.action == "credit"
+    assert r.amount == Decimal("100")
+    assert r.customer == "محمد"
+    r2 = parse_message("تسديد علي 50")
+    assert r2.action == "credit"
+    assert r2.customer == "علي"
+
+
+def test_parse_close_word_with_waw():
+    """«وشكرا» (بواو العطف) كانت تلتصق باسم العميل فيُنشأ عميل بلا معنى."""
+    from app.nlp.parser import parse_message
+
+    r = parse_message("دفع علي 100 وشكرا")
+    assert r.customer == "علي"
+
+
+def test_list_inactive_customers_single_balance_request(monkeypatch):
+    """أداء: كانت أرصدة غير النشطين تُجلب صفاً-صف (N+1) — طلب View واحد الآن."""
+    from datetime import datetime, timezone
+
+    from app.services import Database
+
+    d = Database()
+    calls: list[str] = []
+
+    def fake_req(method, path, query="", payload=None, headers=None):
+        calls.append(path)
+        if path == "customers":
+            return 200, [
+                {"id": "c1", "name": "قديم",
+                 "last_activity_at": "2026-01-01T00:00:00+00:00"},
+                {"id": "c2", "name": "نشط",
+                 "last_activity_at": datetime.now(timezone.utc).isoformat()},
+            ]
+        if path == "v_customer_balances":
+            return 200, [{"id": "c1", "balance": "500"}, {"id": "c2", "balance": "0"}]
+        return 200, []
+
+    d._req = fake_req
+    rows = d.list_inactive_customers(days=30, with_balance=True)
+    assert len(rows) == 1 and rows[0]["id"] == "c1"
+    assert rows[0]["balance"] == Decimal("500")
+    # طلب واحد للـ View — لا استدعاء رصيد لكل عميل
+    assert calls.count("v_customer_balances") == 1
+
+
+def test_validate_order_rejects_injection_defense_in_depth():
+    """حارس فئة ORDER BY: القيم الثابتة الشرعية تنجح، وأي شذوذ يُرفض قبل الإرسال."""
+    from app.services import _validate_order
+
+    # القيم المستخدمة فعلياً في الكود — كلها ثوابت آمنة
+    _validate_order("select=id&order=created_at.desc,id.desc")
+    _validate_order("order=name")
+    _validate_order("order=balance.desc")
+
+    # محاولات حقن/شذوذ — تُرفض فوراً (دفاع متعمق حتى للاستخدام المستقبلي)
+    for evil in (
+        "order=name;select pg_sleep(10)",
+        "order=name desc--",
+        "order=customer_id)::text",
+        "order=(select 1)",
+        "order=created_at.DESC",  # الحالة الصارمة حصرياً asc/desc
+    ):
+        with pytest.raises(RuntimeError):
+            _validate_order(f"select=id&{evil}")
 
 
 def test_card_shows_net_beside_running_balance():
