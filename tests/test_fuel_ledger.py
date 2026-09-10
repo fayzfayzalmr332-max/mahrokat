@@ -433,8 +433,8 @@ def test_show_balance_integrated_card_cash_and_fuel_separate(monkeypatch):
     asyncio.run(botmod._show_balance(upd, "محمد"))
     text = upd.effective_message.sent[0][0]
     # قسم النقد
-    assert "بطاقة العميل" in text
-    assert "الرصيد النقدي" in text
+    assert "محمد" in text
+    assert "الرصيد المتبقي" in text
     assert "15,000 ل.س" in text
     assert "15,000.00" not in text  # لا فواصل عشرية لليرة السورية
     # قسم اللترات — منفصل ومُعلَّم كحساب مستقل
@@ -529,7 +529,8 @@ def test_show_balance_old_db_without_fuel_table_no_crash(monkeypatch):
     upd = _Upd()
     asyncio.run(botmod._show_balance(upd, "محمد"))
     text = upd.effective_message.sent[0][0]
-    assert "الرصيد النقدي" in text
+    assert "محمد" in text
+    assert "الرصيد المتبقي" in text
     assert "7,000 ل.س" in text
     assert "7,000.00" not in text  # لا فواصل عشرية لليرة السورية
     assert "لتر" not in text  # لا قسم وقود ولا انهيار

@@ -319,32 +319,33 @@ def _render_customer_card(
     cust_id: str,
     now: datetime | None = None,
 ) -> str:
-    """بطاقة العميل بالصيغة المعتمدة — محسّنة للنسخ إلى واتساب.
+    """بطاقة العميل بالصيغة المعتمدة — دفتر ديون محاسبي.
 
     المعادلة المحاسبية الصارمة: الرصيد التراكمي = السابق + الدين - السداد.
     المبالغ مخزَّنة موقَّعة (دين +/سداد −) فالتجميع: running += amt دائماً.
 
-    الصيغة محسّنة لواتساب: بلا رموز اتجاه (⬅️⬇️) ولا فواصل ═ (Box Drawing)
-    ولا أقواس زخرفية (⟪⟫) — نص نقي آمن على كل الأجهزة.
+    الصيغة محسّنة لواتساب: بلا رموز اتجاه (⬅️⬇️) ولا أقواس زخرفية (⟪⟫) —
+    نص نقي بإشارات محاسبية واضحة: سحب (دين) + / سداد (دفع) −.
     """
     if now is None:
         now = _local_now()
     stamp = _fmt_dt_local(now)
 
     lines = [
-        "🏢 محطة محروقات العمر",
+        f"⛽ {_STATION_NAME}",
         "",
-        f"💳 بطاقة العميل: {name}",
-        f"📅 تاريخ الجرد: {stamp}",
+        name,
+        stamp,
         "",
-        f"💰 الرصيد النقدي الحالي: {_fmt_money_int(balance)}",
+        _STMT_SEP,
+        f"الرصيد المتبقي: {_stmt_customer_amount(balance)}",
     ]
     if fuel_balances and (fuel_balances.get("mazot", 0) != 0 or fuel_balances.get("benzine", 0) != 0):
         lines.append(
             f"⛽ مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
             f"  |  بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر"
         )
-    lines += ["", "📊 سجل العمليات المالي للعميل:", ""]
+    lines += [_STMT_SEP, "", "سجل العمليات:", ""]
 
     # مصدر الحقيقة: running_balance من v_customer_ledger حكماً (SUM موقَّع
     # في SQL — مستحيل أن يخالف المحاسبة)، والاحتياطي: running += amt
@@ -369,17 +370,18 @@ def _render_customer_card(
 
     for r in ledger:
         tx_type = r.get("tx_type", "")
-        kind = "سحب محروقات" if tx_type == "debit" else "سداد"
-        amt = to_decimal(r.get("amount") or 0)
-        bal = balances_map.get(r.get("id", ""), Decimal("0.000"))
+        kind = "سحب (دين)" if tx_type == "debit" else "سداد (دفع)"
+        amt = _stmt_signed_amount(r.get("amount") or 0, tx_type)
         dt = _fmt_dt_compact(r.get("created_at"))
-        lines.append(f"{dt}  {kind}  {abs(int(amt)):,}  (الرصيد: {abs(int(bal)):,})")
+        lines.append(f"{dt}")
+        lines.append(f"  {kind} · {amt}")
 
     lines += [
         "",
-        f"⚖️ صافي المطالبة النقدية: {_fmt_money_int(balance)}",
+        _STMT_SEP,
+        f"الصافي: {_stmt_customer_amount(balance)}",
         "",
-        "✨ شكراً لثقتكم وموقعكم في محطة العمر",
+        "شكراً لثقتكم بمحطة العمر",
     ]
     return "\n".join(lines)
 
@@ -1678,8 +1680,8 @@ PAGE_SIZE = 8
 async def _render_customer_page(update, context, customers, page: int) -> None:
     """يعرض صفحة من العملاء — كل عميل بسجل عملياته بنسيق موحّد آمن على واتساب.
 
-    التنسيق الجديد: بلا رموز اتجاه (⬅️⬇️) ولا فواصل ═ (Box Drawing) — نص نقي
-    آمن على كل الأجهزة ومناسب للنسخ إلى واتساب.
+    التنسيق الجديد: بلا رموز اتجاه (⬅️⬇️) — نص نقي بإشارات محاسبية واضحة:
+    سحب (دين) + / سداد (دفع) −.
     """
     total = len(customers)
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -1687,27 +1689,22 @@ async def _render_customer_page(update, context, customers, page: int) -> None:
     start = page * PAGE_SIZE
     chunk = customers[start : start + PAGE_SIZE]
 
-    lines = [f"🗂️ قائمة العملاء — صفحة {page + 1}/{pages}", ""]
+    lines = [f"⛽ {_STATION_NAME}", "", f"صفحة {page + 1}/{pages}", ""]
 
     for c in chunk:
         name = c.get("name", "—")
         bal = to_decimal(c.get("balance", 0))
-        sign = "🔴" if bal > 0 else ("🟢" if bal < 0 else "⚪")
-        lines.append(f"{sign} {name} — الرصيد: {_fmt_money(bal)}")
+        lines.append(f"{name} — الرصيد: {_stmt_customer_amount(bal)}")
 
         ledger = db.get_ledger(c.get("id"))
         if ledger:
             for r in ledger:
                 tx_type = r.get("tx_type", "")
-                kind = "سحب محروقات" if tx_type == "debit" else "سداد"
-                amt = to_decimal(r.get("amount") or 0)
-                rb = r.get("running_balance")
-                bal_after = to_decimal(rb) if rb is not None else None
+                kind = "سحب (دين)" if tx_type == "debit" else "سداد (دفع)"
+                amt = _stmt_signed_amount(r.get("amount") or 0, tx_type)
                 dt = _fmt_dt_compact(r.get("created_at"))
-                if bal_after is not None:
-                    lines.append(f"  {dt}  {kind}  {_stmt_customer_amount(amt)}  (الرصيد: {_stmt_customer_amount(bal_after)})")
-                else:
-                    lines.append(f"  {dt}  {kind}  {_stmt_customer_amount(amt)}")
+                lines.append(f"  {dt}")
+                lines.append(f"    {kind} · {amt}")
         else:
             lines.append("  (لا عمليات مسجلة)")
         lines.append("")
@@ -2193,35 +2190,33 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         except Exception:  # noqa: BLE001
             ledger = []
         lines = [
-            "🏢 محطة محروقات العمر",
+            f"⛽ {_STATION_NAME}",
             "",
-            f"🪪 بطاقة العميل: {c['name']}",
-            f"📅 تاريخ الجرد: {_fmt_dt_local(_local_now())}",
+            name,
+            _fmt_dt_local(_local_now()),
             "",
-            f"💳 الرصيد: {_fmt_money(bal)}",
-            f"🔄 عدد الحركات: {_hi_num(count)}",
-            f"🕒 آخر نشاط: {_fmt_dt(last) if last else '—'}",
+            _STMT_SEP,
+            f"الرصيد المتبقي: {_stmt_customer_amount(bal)}",
+            f"عدد الحركات: {_hi_num(count)}",
+            f"آخر نشاط: {_fmt_dt(last) if last else '—'}",
             "",
         ]
         if ledger:
-            lines.append("📊 سجل العمليات المالي للعميل:")
+            lines.append("سجل العمليات:")
             lines.append("")
             for r in ledger:
                 tx_type = r.get("tx_type", "")
-                kind = "سحب محروقات" if tx_type == "debit" else "سداد"
-                amt = to_decimal(r.get("amount") or 0)
-                rb = r.get("running_balance")
-                bal_after = to_decimal(rb) if rb is not None else None
+                kind = "سحب (دين)" if tx_type == "debit" else "سداد (دفع)"
+                amt = _stmt_signed_amount(r.get("amount") or 0, tx_type)
                 dt = _fmt_dt_compact(r.get("created_at"))
-                if bal_after is not None:
-                    lines.append(f"{dt}  {kind}  {_stmt_customer_amount(amt)}  (الرصيد: {_stmt_customer_amount(bal_after)})")
-                else:
-                    lines.append(f"{dt}  {kind}  {_stmt_customer_amount(amt)}")
+                lines.append(f"{dt}")
+                lines.append(f"  {kind} · {amt}")
         else:
-            lines.append("— لا توجد حركات نقدية مسجلة لهذا العميل بعد.")
+            lines.append("لا توجد حركات مسجلة لهذا العميل بعد.")
         lines += [
             "",
-            f"⚖️ الرصيد الصافي: {_fmt_money(bal)}",
+            _STMT_SEP,
+            f"الصافي: {_stmt_customer_amount(bal)}",
         ]
         await update.effective_message.reply_text("\n".join(lines))
     except ValueError:
@@ -2342,8 +2337,9 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ── كشف الحساب المالي الموحّد (الصيغة المعتمدة — محسّنة لواتساب) ─────
+# ── كشف الحساب المالي الموحّد (الصيغة المعتمدة — دفتر ديون محاسبي) ──
 _STATION_NAME = "محطة محروقات العمر"
+_STMT_SEP = "═" * 30
 
 
 def _stmt_customer_amount(amount) -> str:
@@ -2358,6 +2354,22 @@ def _stmt_customer_amount(amount) -> str:
     return f"{_hi_num(f'{d:,.2f}')} ل.س"
 
 
+def _stmt_signed_amount(amount, tx_type: str) -> str:
+    """مبلغ موقَّع للكشف: سحب (دين) + / سداد (دفع) −.
+
+    دفتر ديون: السحب = العميل أخذ محروقات = دين عليه (+)
+    السداد = العميل دفع = يقلّل دينه (−)
+    """
+    d = to_decimal(amount)
+    abs_d = abs(d)
+    if abs_d == abs_d.to_integral_value():
+        formatted = _hi_num(f'{int(abs_d):,}')
+    else:
+        formatted = _hi_num(f'{abs_d:,.2f}')
+    sign = "+" if tx_type == "debit" else "−"
+    return f"{sign}{formatted} ل.س"
+
+
 def _render_financial_statement(
     name: str,
     ledger: list[dict],
@@ -2366,47 +2378,56 @@ def _render_financial_statement(
     now: datetime | None = None,
     truncated_from: int | None = None,
 ) -> str:
-    """كشف حساب العميل بالنموذج المبسّط المعتمد 2026-09 (نصّ صافٍ بلا Markdown).
+    """كشف حساب العميل بالنموذج المعتمد 2026-09 (نصّ صافٍ بلا Markdown).
 
     قرارات التبسيط الهندسي-التجاري المعتمدة:
       - بلا رصيد تراكمي لكل سطر (شتّت الزبون) — الإجمالي أعلى وأسفل فقط.
       - بلا رموز اتجاه (⬅️⬇️) تسبب تقلب Bidi عند النسخ إلى واتساب.
-      - بلا فواصل ═ (Box Drawing) تتعطل على خطوط واتساب غير الثابتة.
-      - مسافات بيضاء فاصلة بدل الخطوط — آمنة على كل الأجهزة.
+      - فواصل ═ (Box Drawing) آمنة على واتساب وتفصل الأقسام.
+      - كل حركة على سطرين (التاريخ فوق، التفاصيل تحت) — سهل المتابعة.
+      - إشارات محاسبية واضحة: سحب (دين) + / سداد (دفع) −.
       - ledger تأتي تصاعدياً زمنياً (خرج get_ledger) — الأقدم أولاً.
     """
     local_now = now or _local_now()
     lines = [
-        f"🏢 {_STATION_NAME}",
+        f"⛽ {_STATION_NAME}",
         "",
-        f"👤 العميل العزيز: {name}",
-        f"📅 الكشف: {_fmt_dt_local(local_now)}",
+        name,
+        _fmt_dt_local(local_now),
         "",
-        f"📌 المتبقي سداداً: {_stmt_customer_amount(balance)}",
+        _STMT_SEP,
+        f"الرصيد المتبقي: {_stmt_customer_amount(balance)}",
+        _STMT_SEP,
         "",
-        "📊 آخر عملياتك:",
+        "آخر الحركات:",
+        "",
     ]
     if not ledger:
-        lines.append("🕐 لا توجد عمليات مسجلة على هذا الحساب بعد.")
+        lines.append("لا توجد عمليات مسجلة على هذا الحساب بعد.")
     else:
         if truncated_from:
             lines.append(
                 f"(عرض آخر {_hi_num(str(len(ledger)))} حركة"
                 f" من إجمالي {_hi_num(str(truncated_from))})"
             )
+            lines.append("")
         for r in ledger:
             date_s = _fmt_dt_compact(r.get("created_at"))
-            amt = _stmt_customer_amount(r.get("amount") or 0)
-            if r.get("tx_type") == "credit":
-                lines.append(f"{date_s}  سداد  {amt}")
+            tx_type = r.get("tx_type", "")
+            amt = _stmt_signed_amount(r.get("amount") or 0, tx_type)
+            if tx_type == "credit":
+                lines.append(f"{date_s}")
+                lines.append(f"  سداد (دفع) · {amt}")
             else:
-                lines.append(f"{date_s}  سحب محروقات  {amt}")
+                lines.append(f"{date_s}")
+                lines.append(f"  سحب (دين) · {amt}")
     lines += [
         "",
-        f"⚖️ المتبقي سداداً: {_stmt_customer_amount(balance)}",
+        _STMT_SEP,
+        f"الصافي: {_stmt_customer_amount(balance)}",
         "",
-        "✨ شكراً لثقتكم بمحطة العمر",
-        "🔄 لأي استفسار عن حركة، راسلنا عليها",
+        "شكراً لثقتكم بمحطة العمر",
+        "لأي استفسار، راسلنا",
     ]
     return "\n".join(lines)
 
@@ -2799,22 +2820,25 @@ async def _render_history_page(
     bal = db.get_balance(customer_id)
 
     lines = [
-        f"🏢 {_STATION_NAME}",
+        f"⛽ {_STATION_NAME}",
         "",
-        f"👤 العميل العزيز: {customer_name}",
-        f"📄 صفحة {page + 1}/{pages}",
+        customer_name,
+        f"صفحة {page + 1}/{pages}",
         "",
     ]
     for r in chunk:
         amt = to_decimal(r.get("amount", 0))
         ts = _fmt_dt_compact(r.get("created_at"))
         note = f"  ({r.get('note')})" if r.get("note") else ""
-        if r.get("tx_type") == "credit":
-            lines.append(f"{ts}  سداد  {_stmt_customer_amount(amt)}{note}")
+        tx_type = r.get("tx_type", "")
+        if tx_type == "credit":
+            lines.append(f"{ts}")
+            lines.append(f"  سداد (دفع) · {_stmt_signed_amount(amt, tx_type)}{note}")
         else:
-            lines.append(f"{ts}  سحب محروقات  {_stmt_customer_amount(amt)}{note}")
+            lines.append(f"{ts}")
+            lines.append(f"  سحب (دين) · {_stmt_signed_amount(amt, tx_type)}{note}")
     lines.append("")
-    lines.append(f"⚖️ المتبقي سداداً: {_stmt_customer_amount(bal)}")
+    lines.append(f"الصافي: {_stmt_customer_amount(bal)}")
 
     nav = []
     if page > 0:
