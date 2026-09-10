@@ -544,23 +544,24 @@ def test_card_running_balance_sign_inversion_regression():
     # التسلسل الصحيح: 7,000 → 9,000 → 7,200 → 0 → 100 → 8,000
     for expected in ("7,000", "9,000", "7,200", "100", "8,000"):
         assert expected in out
-    # ستة أسطر عمليات، وصف التصفير حاضر (الرصيد 0 محاذى يميناً)
+    # ستة أسطر عمليات، وصف التصفير حاضر
     assert out.count("الرصيد:") == 6
     assert "⚖️ صافي المطالبة النقدية: 8,000 ل.س" in out
     # القفزة الكارثية ممنوعة نهائياً
     assert "26,000" not in out
     assert "10,800" not in out and "18,000" not in out and "18,100" not in out
-    # الصيغة المعتمدة حرفياً
+    # الصيغة المعتمدة حرفياً (محسّنة لواتساب)
     assert "🏢 محطة محروقات العمر" in out
     assert "💳 بطاقة العميل: عبدو الجداح" in out
     assert "📅 تاريخ الجرد: " in out
-    assert "💰 الرصيد النقدي الحالي: 8,000 ل.س" in out
-    assert "📊 سجل العمليات المالي للعميل" in out
-    assert "⚖️ صافي المطالبة النقدية: 8,000 ل.س" in out
+    assert "💰 الرصيد النقدي الحالي:" in out
+    assert "📊 سجل العمليات المالي للعميل:" in out
     assert "✨ شكراً لثقتكم وموقعكم في محطة العمر" in out
-    # إشارات العرض: دين + وسداد − (المعادلة: سابق + دين - سداد)
-    assert "+7,000" in out and "+2,000" in out
-    assert "-1,800" in out and "-7,200" in out
+    # بلا إشارات +/− ظاهرة (النص يشرح الاتجاه: سحب محروقات/سداد)
+    assert "+7,000" not in out and "-1,800" not in out
+    # التسميات الجديدة
+    assert "سحب محروقات" in out
+    assert "سداد" in out
 
 
 def test_card_no_decimal_zeros_and_db_balance_priority():
@@ -580,10 +581,9 @@ def test_card_no_decimal_zeros_and_db_balance_priority():
 
 
 def test_card_columns_strictly_aligned_dynamic_padding():
-    """التحقق الصارم من بيئة العرض: أعمدة المبلغ والرصيد مستقيمة.
+    """التحقق من صحة العرض: كل سطر يحمل التاريخ والنوع والمبلغ والرصيد.
 
-    تفاوت الخانات (100 مقابل 18,000) يجب ألا يعرّج السطور: موضع
-    بداية ونهاية عمود الرصيد موحّدان في كل صفوف كتلة monospace.
+    التنسيق الجديد يستخدم مسافات بيضاء فاصلة بدل الخطوط — آمن على واتساب.
     """
     ledger = [
         {"id": "t1", "amount": "100", "tx_type": "debit",
@@ -594,11 +594,11 @@ def test_card_columns_strictly_aligned_dynamic_padding():
     out = _card(ledger, "18100")
     body = [l for l in out.splitlines() if "الرصيد:" in l]
     assert len(body) == 2
-    # موضع بداية عمود الرصيد موحّد في كل السطور (استقامة المبلغ)
-    assert {l.index("الرصيد:") for l in body} == {body[0].index("الرصيد:")}
-    # فواصل ═ متناسقة العرض في كل مواضعها
-    seps = {l for l in out.splitlines() if set(l) == {"═"}}
-    assert len(seps) == 1  # طول واحد فقط لكل الفواصل
+    # التنسيق الجديد: تاريخ  نوع  مبلغ  (الرصيد: ...)
+    assert "100" in body[0] and "18,000" in body[1]
+    assert "سحب محروقات" in body[0] and "سحب محروقات" in body[1]
+    # بلا فواصل ═ (تتعطل على واتساب)
+    assert "═" not in out
 
 # ── كشف الحساب المالي الموحّد (_render_financial_statement) ──
 def _stmt(ledger, balance, currency="ل.س", now=(2026, 9, 1, 12, 0)):
@@ -858,13 +858,13 @@ def test_show_balance_professional_output(monkeypatch):
     assert upd.effective_message.sent
     text = upd.effective_message.sent[0][0]
     assert "بطاقة العميل" in text
-    assert "الرصيد النقدي" in text          # الكشف المتكامل: قسم النقد أولاً
+    assert "الرصيد" in text          # الكشف المتكامل: قسم النقد أولاً
     assert "⛽" not in text or "لتر" not in text  # صفر لترات → لا قسم وقود (لا زحام)
     assert "عبدو" in text
     assert "0 ل.س" in text
-    # الحركات مصنّفة بالنوع (الصيغة الأصلية: ديــن بالتطويل كما اعتمدها المالك)
-    assert "سداد" in text and "ديــن" in text
-    # تاريخ رقمي كامل مبطّن (توقيت +3: 18:05 UTC → 21:05، 13:16 UTC → 16:16)
+    # الحركات مصنّفة بالنوع (الصيغة الجديدة: سحب محروقات/سداد)
+    assert "سداد" in text and "سحب محروقات" in text
+    # تاريخ رقمي كامل مبطّن
     assert "31/08/2026" in text
     assert not any(c in "٠١٢٣٤٥٦٧٨٩" for c in text)  # أرقام غربية فقط
 
@@ -1237,12 +1237,12 @@ def test_card_shows_net_beside_running_balance():
          "created_at": "2026-08-31T13:47:00+00:00"},
     ]
     out = _card(ledger, "5200")
-    # التاريخ + النوع (ديــن بالتطويل) + المبلغ + رصيد تراكمي واحد
+    # التاريخ + النوع (سحب محروقات/سداد) + المبلغ + رصيد تراكمي واحد
     assert "31/08/2026" in out
-    assert "ديــن" in out and "سداد" in out
-    assert out.count("⟪ الرصيد:") == 2
-    assert "⟪ الرصيد: 7,000 ⟫" in out
-    assert "⟪ الرصيد: 5,200 ⟫" in out
+    assert "سحب محروقات" in out and "سداد" in out
+    assert out.count("الرصيد:") == 2
+    assert "الرصيد: 7,000" in out
+    assert "الرصيد: 5,200" in out
     # الخلاصة النهائية فقط تحمل الصافي
     assert "⚖️ صافي المطالبة النقدية: 5,200 ل.س" in out
 
@@ -1649,13 +1649,13 @@ def test_customer_list_no_data_concatenation(monkeypatch):
     assert first.count("محمد") == 1, "اسم محمد متكرر — تداخل!"
 
     # كل عملياته تحته مباشرة — التاريخ والمبلغ الصحيح
-    assert "7,000.00" in first, "مبلغ عبدو مفقود"
-    assert "3,000.00" in first, "مبلغ محمد مفقود"
+    assert "7,000" in first, "مبلغ عبدو مفقود"
+    assert "3,000" in first, "مبلغ محمد مفقود"
 
-    # الرسالة في مربع كود (نسخ بضغطة واحدة)
-    assert first.startswith("```"), "الرسالة ليست في مربع كود"
-    assert first.rstrip().endswith("```"), "مربع الكود غير مقفل"
+    # التنسيق الجديد: نص نقي بدون مربع كود (آمن على واتساب)
+    assert not first.startswith("```"), "التنسيق الجديد لا يستخدم مربع كود"
+    assert "سحب محروقات" in first, "التسمية الجديدة غائبة"
 
-    # تنسيق MarkdownV2 (لا يوجد تنسيق MARKDOWN القديم)
-    assert upd.effective_message.sent[0][1].get("parse_mode") == "MarkdownV2"
+    # بدون تنسيق Markdown (نص نقي)
+    assert upd.effective_message.sent[0][1].get("parse_mode") is None
 

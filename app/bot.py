@@ -319,27 +319,24 @@ def _render_customer_card(
     cust_id: str,
     now: datetime | None = None,
 ) -> str:
-    """بطاقة العميل بالصيغة المعتمدة — مستقرة على تليجرام الموبايل العربي.
+    """بطاقة العميل بالصيغة المعتمدة — محسّنة للنسخ إلى واتساب.
 
     المعادلة المحاسبية الصارمة: الرصيد التراكمي = السابق + الدين - السداد.
-    المبالغ مخزَّنة موقَّعة (دين +/سداد −) فالتجميع: running += amt دائماً،
-    والعرض: دين «+» وسداد «−» بأرقام صحيحة بلا كسور (.00 محذوف نهائياً).
+    المبالغ مخزَّنة موقَّعة (دين +/سداد −) فالتجميع: running += amt دائماً.
 
-    الصيغة مُحسّنة للموبايل العربي: التسميات بعد الأرقام (تتدفق طبيعياً
-    مع اتجاه RTL)، فواصل مسافات بسيطة بلا أقواس زخرفية تظهر مشوّهة.
+    الصيغة محسّنة لواتساب: بلا رموز اتجاه (⬅️⬇️) ولا فواصل ═ (Box Drawing)
+    ولا أقواس زخرفية (⟪⟫) — نص نقي آمن على كل الأجهزة.
     """
-    sep = "══════════════════════════════"
     if now is None:
-        now = datetime.now(timezone(timedelta(hours=env_settings.timezone_offset)))
-    h12 = now.hour % 12 or 12
-    ampm = "ص" if now.hour < 12 else "م"
-    stamp = f"{now.day:02d}/{now.month:02d}/{now.year} · {h12:02d}:{now.minute:02d} {ampm}"
+        now = _local_now()
+    stamp = _fmt_dt_local(now)
 
     lines = [
         "🏢 محطة محروقات العمر",
+        "",
         f"💳 بطاقة العميل: {name}",
         f"📅 تاريخ الجرد: {stamp}",
-        sep,
+        "",
         f"💰 الرصيد النقدي الحالي: {_fmt_money_int(balance)}",
     ]
     if fuel_balances and (fuel_balances.get("mazot", 0) != 0 or fuel_balances.get("benzine", 0) != 0):
@@ -347,7 +344,7 @@ def _render_customer_card(
             f"⛽ مازوت: {_fmt_liters(fuel_balances['mazot'])} لتر"
             f"  |  بنزين: {_fmt_liters(fuel_balances['benzine'])} لتر"
         )
-    lines += [sep, "", "📊 سجل العمليات المالي للعميل:", ""]
+    lines += ["", "📊 سجل العمليات المالي للعميل:", ""]
 
     # مصدر الحقيقة: running_balance من v_customer_ledger حكماً (SUM موقَّع
     # في SQL — مستحيل أن يخالف المحاسبة)، والاحتياطي: running += amt
@@ -370,46 +367,19 @@ def _render_customer_card(
             name, running, balance,
         )
 
-    rows_data = []
     for r in ledger:
         tx_type = r.get("tx_type", "")
-        kind = "ديــن" if tx_type == "debit" else "سداد"
+        kind = "سحب محروقات" if tx_type == "debit" else "سداد"
         amt = to_decimal(r.get("amount") or 0)
-        abs_whole = abs(int(amt.to_integral_value(rounding="ROUND_FLOOR")))
-        abs_fmt = _hi_num(f"{abs_whole:,}")
-        signed = f"+{abs_fmt}" if tx_type == "debit" else f"-{abs_fmt}"
         bal = balances_map.get(r.get("id", ""), Decimal("0.000"))
-        rows_data.append(
-            (
-                _fmt_dt_compact(r.get("created_at")),
-                kind,
-                signed,
-                _fmt_int_plain(bal),
-            )
-        )
-
-    # إعادة هندسة السجل ليُفهمه العميل بسهولة على الموبايل العربي:
-    #   • DD/MM/YYYY  [ نوع العملية ]  المبلغ  ⟪ الرصيد بعدها ⟫
-    # - التسمية «الصافي» تُحذف من العمود (كانت تطابق الرصيد فهي تكرار يشتّت)
-    #   والخلاصة «الرصيد الصافي» تبقى في السطر الختامي فقط.
-    # - الاستقامة ديناميكية داخل monospace (rjust) — تتسع وتنضغط تلقائياً
-    #   مع حجم الخانات حتى لو بلغت ملايين (المقاطع الطويلة تُلف لكنها واضحة).
-    if rows_data:
-        w_amt = max(len(x[2]) for x in rows_data)
-        w_bal = max(len(x[3]) for x in rows_data)
-        body = [
-            f"• {dt}  [ {kind} ]  {signed.rjust(w_amt)}  "
-            f"⟪ الرصيد: {bal_s.rjust(w_bal)} ⟫"
-            for dt, kind, signed, bal_s in rows_data
-        ]
-        lines.append("```")
-        lines.extend(body)
-        lines.append("```")
+        dt = _fmt_dt_compact(r.get("created_at"))
+        lines.append(f"{dt}  {kind}  {abs(int(amt)):,}  (الرصيد: {abs(int(bal)):,})")
 
     lines += [
-        sep,
+        "",
         f"⚖️ صافي المطالبة النقدية: {_fmt_money_int(balance)}",
-        "✨ شكراً لثقتكم وموقعكم في محطة العمر، يسعدنا دائماً خدمتكم.",
+        "",
+        "✨ شكراً لثقتكم وموقعكم في محطة العمر",
     ]
     return "\n".join(lines)
 
@@ -1706,11 +1676,10 @@ PAGE_SIZE = 8
 
 
 async def _render_customer_page(update, context, customers, page: int) -> None:
-    """يعرض صفحة من العملاء — كل عميل بسجل عملياته الكامل في جدول شبكي موحّد.
+    """يعرض صفحة من العملاء — كل عميل بسجل عملياته بنسيق موحّد آمن على واتساب.
 
-    مربع نسخ واحد شامل: اسم العميل ورصيده فوق جدول عملياته (التاريخ، النوع،
-    المبلغ، الرصيد التراكمي) — وأسطر مرصوصة داخل كتلة كود مكتملة القفل.
-    النسخ بضغطة واحدة ينقل كل شيء، والفصل بين العملاء بصري تام بلا تداخل.
+    التنسيق الجديد: بلا رموز اتجاه (⬅️⬇️) ولا فواصل ═ (Box Drawing) — نص نقي
+    آمن على كل الأجهزة ومناسب للنسخ إلى واتساب.
     """
     total = len(customers)
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -1718,30 +1687,32 @@ async def _render_customer_page(update, context, customers, page: int) -> None:
     start = page * PAGE_SIZE
     chunk = customers[start : start + PAGE_SIZE]
 
-    meta = [f"🗂️ قائمة العملاء — صفحة {page + 1}/{pages}", ""]
-    blocks: list[list[str]] = []
+    lines = [f"🗂️ قائمة العملاء — صفحة {page + 1}/{pages}", ""]
 
     for c in chunk:
         name = c.get("name", "—")
         bal = to_decimal(c.get("balance", 0))
         sign = "🔴" if bal > 0 else ("🟢" if bal < 0 else "⚪")
-        header = f"{sign} {name} — الرصيد: {_fmt_money(bal)}"
+        lines.append(f"{sign} {name} — الرصيد: {_fmt_money(bal)}")
 
         ledger = db.get_ledger(c.get("id"))
         if ledger:
-            rows, _ = _cash_card_rows(ledger)
-            grid = _grid(
-                ["التاريخ", "النوع", "المبلغ", "الرصيد"],
-                rows,
-                ["l", "l", "r", "r"],
-            )
-            blocks.append([header, *grid])
+            for r in ledger:
+                tx_type = r.get("tx_type", "")
+                kind = "سحب محروقات" if tx_type == "debit" else "سداد"
+                amt = to_decimal(r.get("amount") or 0)
+                rb = r.get("running_balance")
+                bal_after = to_decimal(rb) if rb is not None else None
+                dt = _fmt_dt_compact(r.get("created_at"))
+                if bal_after is not None:
+                    lines.append(f"  {dt}  {kind}  {_stmt_customer_amount(amt)}  (الرصيد: {_stmt_customer_amount(bal_after)})")
+                else:
+                    lines.append(f"  {dt}  {kind}  {_stmt_customer_amount(amt)}")
         else:
-            blocks.append([header, "  (لا عمليات مسجلة)"])
+            lines.append("  (لا عمليات مسجلة)")
+        lines.append("")
 
-    footer = [f"إجمالي العملاء: {total}"]
-
-    pages_blocks = _group_customer_blocks(meta, blocks, footer)
+    lines.append(f"إجمالي العملاء: {total}")
 
     nav = []
     if page > 0:
@@ -1758,23 +1729,17 @@ async def _render_customer_page(update, context, customers, page: int) -> None:
     kb.append([InlineKeyboardButton("⚡ رصيد سريع", callback_data=CALLBACK_QUICK)])
     keyboard = InlineKeyboardMarkup(kb)
 
-    text = _code_page(pages_blocks[0] if pages_blocks else meta + ["", "لا بيانات."])
+    text = "\n".join(lines)
 
     if update.callback_query:
         await _safe_edit(
             update.callback_query,
             text,
-            parse_mode=ParseMode.MARKDOWN_V2,
             reply_markup=keyboard,
         )
     else:
         await update.effective_message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard
-        )
-
-    for extra in pages_blocks[1:]:
-        await update.effective_message.reply_text(
-            _code_page(extra), parse_mode=ParseMode.MARKDOWN_V2
+            text, reply_markup=keyboard
         )
 
 
@@ -2227,25 +2192,38 @@ async def cmd_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             ledger = db.get_ledger(found["id"])  # الكامل: الأقدم أولاً + رصيد تراكمي
         except Exception:  # noqa: BLE001
             ledger = []
-        meta = [
-            f"🪪 بطاقة العميل — {c['name']}",
+        lines = [
+            "🏢 محطة محروقات العمر",
+            "",
+            f"🪪 بطاقة العميل: {c['name']}",
+            f"📅 تاريخ الجرد: {_fmt_dt_local(_local_now())}",
+            "",
             f"💳 الرصيد: {_fmt_money(bal)}",
             f"🔄 عدد الحركات: {_hi_num(count)}",
             f"🕒 آخر نشاط: {_fmt_dt(last) if last else '—'}",
-            f"📅 تاريخ الجرد: {_fmt_dt_local(_local_now())}",
+            "",
         ]
         if ledger:
-            meta.append(f"سجل العمليات الكامل ({len(ledger)} عملية) — الأقدم أولاً:")
-            rows, footer = _cash_card_rows(ledger)
-            footer.append(f"⚖️ الرصيد الصافي: {_fmt_money(bal)}")
-            table = _grid(
-                ["التاريخ", "النوع", "المبلغ", "الرصيد"],
-                rows, ["l", "l", "r", "r"],
-            )
+            lines.append("📊 سجل العمليات المالي للعميل:")
+            lines.append("")
+            for r in ledger:
+                tx_type = r.get("tx_type", "")
+                kind = "سحب محروقات" if tx_type == "debit" else "سداد"
+                amt = to_decimal(r.get("amount") or 0)
+                rb = r.get("running_balance")
+                bal_after = to_decimal(rb) if rb is not None else None
+                dt = _fmt_dt_compact(r.get("created_at"))
+                if bal_after is not None:
+                    lines.append(f"{dt}  {kind}  {_stmt_customer_amount(amt)}  (الرصيد: {_stmt_customer_amount(bal_after)})")
+                else:
+                    lines.append(f"{dt}  {kind}  {_stmt_customer_amount(amt)}")
         else:
-            table, footer = [], []
-            meta += ["", "— لا توجد حركات نقدية مسجلة لهذا العميل بعد."]
-        await _reply_card(update, _split_pages(meta, table, footer))
+            lines.append("— لا توجد حركات نقدية مسجلة لهذا العميل بعد.")
+        lines += [
+            "",
+            f"⚖️ الرصيد الصافي: {_fmt_money(bal)}",
+        ]
+        await update.effective_message.reply_text("\n".join(lines))
     except ValueError:
         await update.effective_message.reply_text(f"لا يوجد عميل باسم «{name}».")
     except Exception as exc:
